@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,28 +9,47 @@ from sklearn.cluster import DBSCAN
 from sklearn.neighbors import LocalOutlierFactor
 
 
+# =========================================================
+# COLUMN NORMALIZATION
+# =========================================================
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     lat_col = None
     lon_col = None
+    left_col = None
+    right_col = None
+    rotor_col = None
     time_col = None
 
     for c in df.columns:
         lc = c.lower().strip()
+
         if lc in ["latitude", "lat"]:
             lat_col = c
         elif lc in ["longitude", "lon", "lng", "long"]:
             lon_col = c
+        elif lc in ["left rpm", "left_rpm", "leftrpm", "feedback_left_rpm"]:
+            left_col = c
+        elif lc in ["right rpm", "right_rpm", "rightrpm", "feedback_right_rpm"]:
+            right_col = c
+        elif lc in ["rotor rpm", "rotor_rpm", "rotorrpm", "feedback_rotor_rpm"]:
+            rotor_col = c
         elif lc in ["timestamp", "time", "created_at", "ts", "datetime", "date_time"]:
             time_col = c
 
     if lat_col is None or lon_col is None:
+        raise ValueError("Could not detect lat/long columns.")
+
+    if left_col is None or right_col is None or rotor_col is None:
         raise ValueError(
-            "Could not detect latitude/longitude columns. Use latitude/lat and longitude/lon/lng/long."
+            "Could not detect RPM columns. Needed columns: left rpm, right rpm, rotor rpm."
         )
 
     out = pd.DataFrame()
     out["latitude"] = pd.to_numeric(df[lat_col], errors="coerce")
     out["longitude"] = pd.to_numeric(df[lon_col], errors="coerce")
+    out["left_rpm"] = pd.to_numeric(df[left_col], errors="coerce").fillna(0)
+    out["right_rpm"] = pd.to_numeric(df[right_col], errors="coerce").fillna(0)
+    out["rotor_rpm"] = pd.to_numeric(df[rotor_col], errors="coerce").fillna(0)
 
     if time_col is not None:
         out["timestamp"] = pd.to_datetime(df[time_col], errors="coerce")
@@ -54,6 +73,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
+
     if name.endswith(".csv"):
         raw = pd.read_csv(uploaded_file)
     elif name.endswith(".xlsx") or name.endswith(".xls"):
@@ -64,6 +84,9 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     return normalize_columns(raw)
 
 
+# =========================================================
+# GEO
+# =========================================================
 def get_utm_epsg(lat: float, lon: float) -> int:
     zone = int((lon + 180) // 6) + 1
     return 32600 + zone if lat >= 0 else 32700 + zone
@@ -84,6 +107,9 @@ def project_points(df: pd.DataFrame):
     return df, to_utm, to_wgs
 
 
+# =========================================================
+# TRACK FEATURES
+# =========================================================
 def add_track_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -111,6 +137,7 @@ def add_track_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def remove_gross_jump_outliers(df: pd.DataFrame, max_jump_m: float):
     df = df.copy()
+
     is_jump = (
         (df["dist_prev_m"] > max_jump_m) &
         (df["dist_next_m"] > max_jump_m)
@@ -126,152 +153,222 @@ def remove_gross_jump_outliers(df: pd.DataFrame, max_jump_m: float):
     return kept.reset_index(drop=True), removed.reset_index(drop=True)
 
 
-def mark_dense_points(df: pd.DataFrame, radius_m: float, min_neighbors: int) -> pd.DataFrame:
-    """
-    Simple local density using grid-friendly neighborhood count.
-    """
+# =========================================================
+# RPM CLASSIFICATION
+# =========================================================
+def classify_rpm_points(
+    df: pd.DataFrame,
+    left_th: float = 20.0,
+    right_th: float = 20.0,
+    rotor_th: float = 50.0,
+) -> pd.DataFrame:
     df = df.copy()
-    coords = df[["x", "y"]].values
-    n = len(df)
 
-    counts = np.zeros(n, dtype=int)
-    r2 = radius_m * radius_m
+    df["is_strong_farm"] = (
+        (df["left_rpm"] > left_th) &
+        (df["right_rpm"] > right_th) &
+        (df["rotor_rpm"] > rotor_th)
+    )
 
-    # chunked pairwise counting to avoid heavy memory spikes
-    chunk = 1000
-    for start in range(0, n, chunk):
-        end = min(n, start + chunk)
-        sub = coords[start:end]
-        dx = sub[:, None, 0] - coords[None, :, 0]
-        dy = sub[:, None, 1] - coords[None, :, 1]
-        dist2 = dx * dx + dy * dy
-        counts[start:end] = (dist2 <= r2).sum(axis=1) - 1
+    df["is_turn_candidate"] = (
+        (df["left_rpm"] > left_th) &
+        (df["right_rpm"] > right_th) &
+        (df["rotor_rpm"] <= rotor_th)
+    )
 
-    df["neighbor_count"] = counts
-    df["is_dense"] = df["neighbor_count"] >= min_neighbors
     return df
 
 
-def keep_revisit_farm_runs(
+# =========================================================
+# STRONG FARM ANCHOR CLUSTER
+# =========================================================
+def cluster_strong_farm_points(
     df: pd.DataFrame,
-    cell_size_m: float = 2.0,
-    neighborhood_cells: int = 1,
-    min_local_revisit_score: int = 18,
-    min_cell_visits: int = 3,
-    min_run_points: int = 20,
-    expand_points: int = 20,
+    eps_m: float = 15.0,
+    min_samples: int = 15,
+):
+    strong_df = df[df["is_strong_farm"]].copy()
+    non_strong_removed = df[~df["is_strong_farm"]].copy()
+    non_strong_removed["remove_reason"] = "not_strong_farm"
+
+    if strong_df.empty:
+        return strong_df, non_strong_removed
+
+    coords = strong_df[["x", "y"]].values
+    labels = DBSCAN(eps=eps_m, min_samples=min_samples).fit_predict(coords)
+    strong_df["cluster_id"] = labels
+
+    noise_removed = strong_df[strong_df["cluster_id"] == -1].copy()
+    noise_removed["remove_reason"] = "strong_dbscan_noise"
+
+    anchored = strong_df[strong_df["cluster_id"] != -1].copy()
+
+    if anchored.empty:
+        removed = pd.concat([non_strong_removed, noise_removed], ignore_index=True)
+        return anchored, removed
+
+    counts = anchored["cluster_id"].value_counts()
+    valid_clusters = counts[counts >= min_samples].index.tolist()
+    tiny_removed = anchored[~anchored["cluster_id"].isin(valid_clusters)].copy()
+    tiny_removed["remove_reason"] = "strong_tiny_cluster"
+
+    anchored = anchored[anchored["cluster_id"].isin(valid_clusters)].copy()
+
+    removed = pd.concat([non_strong_removed, noise_removed, tiny_removed], ignore_index=True)
+    return anchored.reset_index(drop=True), removed.reset_index(drop=True)
+
+
+# =========================================================
+# TURN POINT RECOVERY
+# =========================================================
+def _nearest_distance_to_points(source_xy: np.ndarray, target_xy: np.ndarray) -> np.ndarray:
+    if len(source_xy) == 0:
+        return np.array([])
+    if len(target_xy) == 0:
+        return np.full(len(source_xy), np.inf)
+
+    chunk = 1000
+    out = np.empty(len(source_xy), dtype=float)
+
+    for s in range(0, len(source_xy), chunk):
+        e = min(len(source_xy), s + chunk)
+        sub = source_xy[s:e]
+        dx = sub[:, None, 0] - target_xy[None, :, 0]
+        dy = sub[:, None, 1] - target_xy[None, :, 1]
+        dist2 = dx * dx + dy * dy
+        out[s:e] = np.sqrt(dist2.min(axis=1))
+
+    return out
+
+
+def recover_valid_turn_points(
+    df: pd.DataFrame,
+    anchor_df: pd.DataFrame,
+    anchor_buffer_m: float = 18.0,
+    turn_time_gap_sec: float = 30.0,
 ):
     """
-    Strong farm-vs-road logic:
-    - Convert points to small grid cells
-    - Count revisits per cell
-    - Also count revisits in neighboring cells
-    - Keep only trajectory runs where local revisit score is high
-
-    Why this works:
-    - Farm work revisits the same local area many times
-    - Road transit usually passes through cells only once or a few times
+    Keep turn points if:
+    1) they are spatially near strong farm anchor points, or
+    2) they are temporally sandwiched between strong farm points.
     """
-    if df.empty:
-        return df.copy(), df.copy()
+    turn_df = df[df["is_turn_candidate"]].copy()
+
+    if turn_df.empty:
+        turn_df["remove_reason"] = []
+        return turn_df, turn_df
+
+    anchor_xy = anchor_df[["x", "y"]].values if not anchor_df.empty else np.empty((0, 2))
+    turn_xy = turn_df[["x", "y"]].values
+
+    turn_df["dist_to_anchor_m"] = _nearest_distance_to_points(turn_xy, anchor_xy)
+    turn_df["near_anchor"] = turn_df["dist_to_anchor_m"] <= anchor_buffer_m
+
+    # Temporal sandwich rule
+    is_anchor = df["is_strong_farm"].values
+    prev_anchor_idx = np.full(len(df), -1, dtype=int)
+    next_anchor_idx = np.full(len(df), -1, dtype=int)
+
+    last_idx = -1
+    for i in range(len(df)):
+        if is_anchor[i]:
+            last_idx = i
+        prev_anchor_idx[i] = last_idx
+
+    next_idx = -1
+    for i in range(len(df) - 1, -1, -1):
+        if is_anchor[i]:
+            next_idx = i
+        next_anchor_idx[i] = next_idx
 
     df = df.copy()
+    df["prev_anchor_idx"] = prev_anchor_idx
+    df["next_anchor_idx"] = next_anchor_idx
 
-    min_x = df["x"].min()
-    min_y = df["y"].min()
+    turn_df = turn_df.merge(
+        df[["row_id", "prev_anchor_idx", "next_anchor_idx"]],
+        on="row_id",
+        how="left",
+    )
 
-    df["gx"] = np.floor((df["x"] - min_x) / cell_size_m).astype(int)
-    df["gy"] = np.floor((df["y"] - min_y) / cell_size_m).astype(int)
+    if df["timestamp"].notna().any():
+        timestamps = df["timestamp"].reset_index(drop=True)
 
-    cell_counts = df.groupby(["gx", "gy"]).size().to_dict()
-    df["cell_visit_count"] = [cell_counts[(gx, gy)] for gx, gy in zip(df["gx"], df["gy"])]
+        def time_ok(row) -> bool:
+            p = int(row["prev_anchor_idx"])
+            n = int(row["next_anchor_idx"])
+            cur_idx = int(row.name)
 
-    local_scores = []
-    strong_revisit_flags = []
+            cur_ts = row["timestamp"]
+            if pd.isna(cur_ts):
+                return False
 
-    for gx, gy, cell_visits in zip(df["gx"], df["gy"], df["cell_visit_count"]):
-        total = 0
-        for dx in range(-neighborhood_cells, neighborhood_cells + 1):
-            for dy in range(-neighborhood_cells, neighborhood_cells + 1):
-                total += cell_counts.get((gx + dx, gy + dy), 0)
-        local_scores.append(total)
+            prev_ok = False
+            next_ok = False
 
-        strong_revisit = (cell_visits >= min_cell_visits) or (total >= min_local_revisit_score)
-        strong_revisit_flags.append(strong_revisit)
+            if p >= 0 and pd.notna(timestamps.iloc[p]):
+                prev_ok = abs((cur_ts - timestamps.iloc[p]).total_seconds()) <= turn_time_gap_sec
 
-    df["local_revisit_score"] = local_scores
-    df["is_revisit_farm"] = strong_revisit_flags
+            if n >= 0 and pd.notna(timestamps.iloc[n]):
+                next_ok = abs((timestamps.iloc[n] - cur_ts).total_seconds()) <= turn_time_gap_sec
 
-    farm_idx = np.where(df["is_revisit_farm"].values)[0]
+            return prev_ok and next_ok
 
-    if len(farm_idx) == 0:
-        removed = df.copy()
-        removed["remove_reason"] = "not_revisit_farm"
-        return df.iloc[0:0].copy(), removed
+        turn_df = turn_df.reset_index(drop=True)
+        turn_df["time_connected"] = turn_df.apply(time_ok, axis=1)
+    else:
+        # if no timestamp, rely only on spatial anchor proximity
+        turn_df["time_connected"] = False
 
-    runs = []
-    start = farm_idx[0]
-    prev = farm_idx[0]
+    keep_mask = turn_df["near_anchor"] | turn_df["time_connected"]
 
-    for idx in farm_idx[1:]:
-        if idx == prev + 1:
-            prev = idx
-        else:
-            runs.append((start, prev))
-            start = idx
-            prev = idx
-    runs.append((start, prev))
-
-    keep_mask = np.zeros(len(df), dtype=bool)
-
-    for s, e in runs:
-        run_len = e - s + 1
-        if run_len >= min_run_points:
-            s2 = max(0, s - expand_points)
-            e2 = min(len(df) - 1, e + expand_points)
-            keep_mask[s2:e2 + 1] = True
-
-    kept = df.loc[keep_mask].copy()
-    removed = df.loc[~keep_mask].copy()
-    removed["remove_reason"] = "not_revisit_farm_run"
+    kept = turn_df.loc[keep_mask].copy()
+    removed = turn_df.loc[~keep_mask].copy()
+    removed["remove_reason"] = "turn_not_near_anchor"
 
     return kept.reset_index(drop=True), removed.reset_index(drop=True)
 
 
-def keep_farm_clusters(df: pd.DataFrame, eps_m: float, min_samples: int):
-    dense_df = df[df["is_dense"]].copy()
-    sparse_removed = df[~df["is_dense"]].copy()
-    sparse_removed["remove_reason"] = "sparse_not_farm"
+# =========================================================
+# FINAL CLUSTER + OUTLIER CLEANING
+# =========================================================
+def cluster_final_farm_points(
+    df: pd.DataFrame,
+    eps_m: float = 15.0,
+    min_samples: int = 12,
+):
+    if df.empty:
+        return df.copy(), df.copy()
 
-    if dense_df.empty:
-        return dense_df, sparse_removed
-
-    coords = dense_df[["x", "y"]].values
+    coords = df[["x", "y"]].values
     labels = DBSCAN(eps=eps_m, min_samples=min_samples).fit_predict(coords)
-    dense_df["cluster_id"] = labels
+    df = df.copy()
+    df["cluster_id"] = labels
 
-    noise_removed = dense_df[dense_df["cluster_id"] == -1].copy()
-    noise_removed["remove_reason"] = "dbscan_noise"
+    noise_removed = df[df["cluster_id"] == -1].copy()
+    noise_removed["remove_reason"] = "final_dbscan_noise"
 
-    farm_df = dense_df[dense_df["cluster_id"] != -1].copy()
+    kept = df[df["cluster_id"] != -1].copy()
+    if kept.empty:
+        return kept, noise_removed
 
-    if farm_df.empty:
-        removed = pd.concat([sparse_removed, noise_removed], ignore_index=True)
-        return farm_df, removed
-
-    counts = farm_df["cluster_id"].value_counts()
+    counts = kept["cluster_id"].value_counts()
     valid_clusters = counts[counts >= min_samples].index.tolist()
 
-    tiny_removed = farm_df[~farm_df["cluster_id"].isin(valid_clusters)].copy()
-    tiny_removed["remove_reason"] = "tiny_cluster"
+    tiny_removed = kept[~kept["cluster_id"].isin(valid_clusters)].copy()
+    tiny_removed["remove_reason"] = "final_tiny_cluster"
 
-    farm_df = farm_df[farm_df["cluster_id"].isin(valid_clusters)].copy()
+    kept = kept[kept["cluster_id"].isin(valid_clusters)].copy()
+    removed = pd.concat([noise_removed, tiny_removed], ignore_index=True)
 
-    removed = pd.concat([sparse_removed, noise_removed, tiny_removed], ignore_index=True)
-    return farm_df.reset_index(drop=True), removed.reset_index(drop=True)
+    return kept.reset_index(drop=True), removed.reset_index(drop=True)
 
 
-def remove_cluster_outliers(df: pd.DataFrame, lof_neighbors: int = 20, contamination: float = 0.03):
+def remove_cluster_outliers(
+    df: pd.DataFrame,
+    lof_neighbors: int = 20,
+    contamination: float = 0.03,
+):
     if df.empty:
         return df.copy(), df.copy()
 
@@ -289,7 +386,7 @@ def remove_cluster_outliers(df: pd.DataFrame, lof_neighbors: int = 20, contamina
         n_neighbors = min(lof_neighbors, len(grp) - 1)
         lof = LocalOutlierFactor(
             n_neighbors=n_neighbors,
-            contamination=contamination
+            contamination=contamination,
         )
         pred = lof.fit_predict(coords)
 
@@ -306,10 +403,15 @@ def remove_cluster_outliers(df: pd.DataFrame, lof_neighbors: int = 20, contamina
     return keep_df, rem_df
 
 
-def split_into_segments(df: pd.DataFrame,
-                        max_gap_m: float,
-                        max_gap_sec: float,
-                        min_segment_points: int) -> List[pd.DataFrame]:
+# =========================================================
+# GEOMETRY
+# =========================================================
+def split_into_segments(
+    df: pd.DataFrame,
+    max_gap_m: float,
+    max_gap_sec: float,
+    min_segment_points: int,
+) -> List[pd.DataFrame]:
     if df.empty:
         return []
 
@@ -378,11 +480,13 @@ def build_path_buffer_area(segments: List[pd.DataFrame], work_width_ft: float):
     return unary_union(polys)
 
 
-def build_concave_boundary(df: pd.DataFrame,
-                           point_buffer_m: float,
-                           smooth_m: float,
-                           erode_m: float,
-                           min_cluster_area_m2: float):
+def build_concave_boundary(
+    df: pd.DataFrame,
+    point_buffer_m: float,
+    smooth_m: float,
+    erode_m: float,
+    min_cluster_area_m2: float,
+):
     if df.empty:
         return None
 
@@ -419,29 +523,32 @@ def geom_to_geojson_coords(geom, to_wgs: Transformer):
     if geom.geom_type == "Polygon":
         return {
             "type": "Polygon",
-            "coordinates": [convert_ring(geom.exterior)]
+            "coordinates": [convert_ring(geom.exterior)],
         }
 
-    elif geom.geom_type == "MultiPolygon":
+    if geom.geom_type == "MultiPolygon":
         polys = []
         for poly in geom.geoms:
             polys.append([convert_ring(poly.exterior)])
         return {
             "type": "MultiPolygon",
-            "coordinates": polys
+            "coordinates": polys,
         }
 
     return None
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def calculate_farm_area_from_df(
     input_df: pd.DataFrame,
     work_width_ft: float = 4.0,
     max_point_jump_m: float = 25.0,
-    density_radius_m: float = 10.0,
-    min_neighbors: int = 8,
-    dbscan_eps_m: float = 12.0,
-    dbscan_min_samples: int = 10,
+    density_radius_m: float = 10.0,   # kept for UI compatibility
+    min_neighbors: int = 8,           # kept for UI compatibility
+    dbscan_eps_m: float = 15.0,
+    dbscan_min_samples: int = 15,
     lof_neighbors: int = 20,
     lof_contamination: float = 0.03,
     max_segment_gap_m: float = 20.0,
@@ -456,26 +563,66 @@ def calculate_farm_area_from_df(
     df, _, to_wgs = project_points(all_df)
     df = add_track_features(df)
 
+    # 1) Remove bad GPS jumps
     df1, rem1 = remove_gross_jump_outliers(df, max_point_jump_m)
     df1 = add_track_features(df1)
 
-    df2 = mark_dense_points(df1, density_radius_m, min_neighbors)
-
-    # Strong farm logic based on repeated occupancy of same/surrounding cells
-    df3, rem_revisit = keep_revisit_farm_runs(
-        df2,
-        cell_size_m=2.0,
-        neighborhood_cells=1,
-        min_local_revisit_score=18,
-        min_cell_visits=3,
-        min_run_points=20,
-        expand_points=20,
+    # 2) RPM-based classification
+    df2 = classify_rpm_points(
+        df1,
+        left_th=20.0,
+        right_th=20.0,
+        rotor_th=50.0,
     )
 
-    farm_df, rem2 = keep_farm_clusters(df3, dbscan_eps_m, dbscan_min_samples)
+    # 3) Strong farm anchors: all 3 RPM non-zero
+    anchor_df, rem_anchor = cluster_strong_farm_points(
+        df2,
+        eps_m=dbscan_eps_m,
+        min_samples=dbscan_min_samples,
+    )
+
+    if anchor_df.empty:
+        removed = pd.concat([rem1, rem_anchor], ignore_index=True)
+        return {
+            "all_df": all_df,
+            "clean_df": anchor_df,
+            "removed_df": removed,
+            "concave_geom": None,
+            "path_geom": None,
+            "concave_area_m2": 0.0,
+            "concave_area_sqft": 0.0,
+            "concave_area_guntha": 0.0,
+            "path_area_m2": 0.0,
+            "path_area_sqft": 0.0,
+            "path_area_guntha": 0.0,
+            "to_wgs": to_wgs,
+        }
+
+    # 4) Recover rotor-off turns near farm anchors
+    turn_kept, turn_removed = recover_valid_turn_points(
+        df2,
+        anchor_df=anchor_df,
+        anchor_buffer_m=18.0,
+        turn_time_gap_sec=30.0,
+    )
+
+    # 5) Final farm points = strong anchors + valid turns
+    final_candidates = pd.concat([anchor_df, turn_kept], ignore_index=True)
+    final_candidates = final_candidates.drop_duplicates(subset=["row_id"]).reset_index(drop=True)
+
+    # Optional density marker just for compatibility with old flow / debug
+    final_candidates = mark_dense_points(final_candidates, radius_m=10.0, min_neighbors=3)
+
+    # 6) Re-cluster final farm area
+    farm_df, rem2 = cluster_final_farm_points(
+        final_candidates,
+        eps_m=dbscan_eps_m,
+        min_samples=max(10, dbscan_min_samples // 2),
+    )
 
     if farm_df.empty:
-        removed = pd.concat([rem1, rem_revisit, rem2], ignore_index=True)
+        removed = pd.concat([rem1, rem_anchor, turn_removed, rem2], ignore_index=True)
         return {
             "all_df": all_df,
             "clean_df": farm_df,
@@ -491,13 +638,14 @@ def calculate_farm_area_from_df(
             "to_wgs": to_wgs,
         }
 
+    # 7) Remove spatial outliers within farm
     farm_df, rem3 = remove_cluster_outliers(
         farm_df,
         lof_neighbors=lof_neighbors,
-        contamination=lof_contamination
+        contamination=lof_contamination,
     )
 
-    removed = pd.concat([rem1, rem_revisit, rem2, rem3], ignore_index=True)
+    removed = pd.concat([rem1, rem_anchor, turn_removed, rem2, rem3], ignore_index=True)
 
     if farm_df.empty:
         return {
@@ -515,25 +663,28 @@ def calculate_farm_area_from_df(
             "to_wgs": to_wgs,
         }
 
+    # 8) Final sort
     clean_df = farm_df.copy()
     if clean_df["timestamp"].notna().any():
         clean_df = clean_df.sort_values("timestamp").reset_index(drop=True)
     else:
         clean_df = clean_df.reset_index(drop=True)
 
+    # 9) Boundary area
     concave_geom = build_concave_boundary(
         clean_df,
         point_buffer_m=point_buffer_m,
         smooth_m=boundary_smooth_m,
         erode_m=boundary_erode_m,
-        min_cluster_area_m2=min_cluster_area_m2
+        min_cluster_area_m2=min_cluster_area_m2,
     )
 
+    # 10) Path buffer check area
     segments = split_into_segments(
         clean_df,
         max_gap_m=max_segment_gap_m,
         max_gap_sec=max_segment_time_sec,
-        min_segment_points=min_segment_points
+        min_segment_points=min_segment_points,
     )
     path_geom = build_path_buffer_area(segments, work_width_ft)
 
