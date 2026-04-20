@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -247,16 +247,10 @@ def recover_valid_turn_points(
     anchor_buffer_m: float = 18.0,
     turn_time_gap_sec: float = 30.0,
 ):
-    """
-    Keep turn points if:
-    1) they are spatially near strong farm anchor points, or
-    2) they are temporally sandwiched between strong farm points.
-    """
     turn_df = df[df["is_turn_candidate"]].copy()
 
     if turn_df.empty:
-        turn_df["remove_reason"] = []
-        return turn_df, turn_df
+        return turn_df.copy(), turn_df.copy()
 
     anchor_xy = anchor_df[["x", "y"]].values if not anchor_df.empty else np.empty((0, 2))
     turn_xy = turn_df[["x", "y"]].values
@@ -264,7 +258,6 @@ def recover_valid_turn_points(
     turn_df["dist_to_anchor_m"] = _nearest_distance_to_points(turn_xy, anchor_xy)
     turn_df["near_anchor"] = turn_df["dist_to_anchor_m"] <= anchor_buffer_m
 
-    # Temporal sandwich rule
     is_anchor = df["is_strong_farm"].values
     prev_anchor_idx = np.full(len(df), -1, dtype=int)
     next_anchor_idx = np.full(len(df), -1, dtype=int)
@@ -297,8 +290,6 @@ def recover_valid_turn_points(
         def time_ok(row) -> bool:
             p = int(row["prev_anchor_idx"])
             n = int(row["next_anchor_idx"])
-            cur_idx = int(row.name)
-
             cur_ts = row["timestamp"]
             if pd.isna(cur_ts):
                 return False
@@ -317,7 +308,6 @@ def recover_valid_turn_points(
         turn_df = turn_df.reset_index(drop=True)
         turn_df["time_connected"] = turn_df.apply(time_ok, axis=1)
     else:
-        # if no timestamp, rely only on spatial anchor proximity
         turn_df["time_connected"] = False
 
     keep_mask = turn_df["near_anchor"] | turn_df["time_connected"]
@@ -545,8 +535,8 @@ def calculate_farm_area_from_df(
     input_df: pd.DataFrame,
     work_width_ft: float = 4.0,
     max_point_jump_m: float = 25.0,
-    density_radius_m: float = 10.0,   # kept for UI compatibility
-    min_neighbors: int = 8,           # kept for UI compatibility
+    density_radius_m: float = 10.0,
+    min_neighbors: int = 8,
     dbscan_eps_m: float = 15.0,
     dbscan_min_samples: int = 15,
     lof_neighbors: int = 20,
@@ -563,11 +553,9 @@ def calculate_farm_area_from_df(
     df, _, to_wgs = project_points(all_df)
     df = add_track_features(df)
 
-    # 1) Remove bad GPS jumps
     df1, rem1 = remove_gross_jump_outliers(df, max_point_jump_m)
     df1 = add_track_features(df1)
 
-    # 2) RPM-based classification
     df2 = classify_rpm_points(
         df1,
         left_th=20.0,
@@ -575,7 +563,6 @@ def calculate_farm_area_from_df(
         rotor_th=50.0,
     )
 
-    # 3) Strong farm anchors: all 3 RPM non-zero
     anchor_df, rem_anchor = cluster_strong_farm_points(
         df2,
         eps_m=dbscan_eps_m,
@@ -599,7 +586,6 @@ def calculate_farm_area_from_df(
             "to_wgs": to_wgs,
         }
 
-    # 4) Recover rotor-off turns near farm anchors
     turn_kept, turn_removed = recover_valid_turn_points(
         df2,
         anchor_df=anchor_df,
@@ -607,14 +593,11 @@ def calculate_farm_area_from_df(
         turn_time_gap_sec=30.0,
     )
 
-    # 5) Final farm points = strong anchors + valid turns
     final_candidates = pd.concat([anchor_df, turn_kept], ignore_index=True)
     final_candidates = final_candidates.drop_duplicates(subset=["row_id"]).reset_index(drop=True)
+    final_candidates["neighbor_count"] = 0
+    final_candidates["is_dense"] = True
 
-    # Optional density marker just for compatibility with old flow / debug
-    final_candidates = mark_dense_points(final_candidates, radius_m=10.0, min_neighbors=3)
-
-    # 6) Re-cluster final farm area
     farm_df, rem2 = cluster_final_farm_points(
         final_candidates,
         eps_m=dbscan_eps_m,
@@ -638,7 +621,6 @@ def calculate_farm_area_from_df(
             "to_wgs": to_wgs,
         }
 
-    # 7) Remove spatial outliers within farm
     farm_df, rem3 = remove_cluster_outliers(
         farm_df,
         lof_neighbors=lof_neighbors,
@@ -663,14 +645,12 @@ def calculate_farm_area_from_df(
             "to_wgs": to_wgs,
         }
 
-    # 8) Final sort
     clean_df = farm_df.copy()
     if clean_df["timestamp"].notna().any():
         clean_df = clean_df.sort_values("timestamp").reset_index(drop=True)
     else:
         clean_df = clean_df.reset_index(drop=True)
 
-    # 9) Boundary area
     concave_geom = build_concave_boundary(
         clean_df,
         point_buffer_m=point_buffer_m,
@@ -679,7 +659,6 @@ def calculate_farm_area_from_df(
         min_cluster_area_m2=min_cluster_area_m2,
     )
 
-    # 10) Path buffer check area
     segments = split_into_segments(
         clean_df,
         max_gap_m=max_segment_gap_m,
