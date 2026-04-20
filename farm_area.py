@@ -140,6 +140,60 @@ def mark_dense_points(df: pd.DataFrame, radius_m: float, min_neighbors: int) -> 
     return df
 
 
+def remove_linear_transit_points(
+    df: pd.DataFrame,
+    radius_m: float = 12.0,
+    min_neighbors: int = 8,
+    min_minor_std_m: float = 2.0,
+    min_width_ratio: float = 0.12,
+):
+    """
+    Remove narrow line-like paths such as road/transit.
+    Keep neighborhoods that have real 2D spread like farm working area.
+    """
+    df = df.copy()
+    coords = df[["x", "y"]].values
+
+    nn = NearestNeighbors(radius=radius_m)
+    nn.fit(coords)
+    neigh_ind = nn.radius_neighbors(coords, return_distance=False)
+
+    keep_mask = np.zeros(len(df), dtype=bool)
+    minor_stds = np.zeros(len(df))
+    width_ratios = np.zeros(len(df))
+
+    for i, idxs in enumerate(neigh_ind):
+        if len(idxs) < min_neighbors:
+            keep_mask[i] = False
+            continue
+
+        pts = coords[idxs]
+        centered = pts - pts.mean(axis=0)
+
+        cov = np.cov(centered.T)
+        eigvals = np.linalg.eigvalsh(cov)
+        eigvals = np.sort(np.maximum(eigvals, 1e-9))
+
+        major_std = float(np.sqrt(eigvals[1]))
+        minor_std = float(np.sqrt(eigvals[0]))
+        ratio = minor_std / major_std if major_std > 0 else 0.0
+
+        minor_stds[i] = minor_std
+        width_ratios[i] = ratio
+
+        # Keep only if neighborhood has enough sideways spread
+        keep_mask[i] = (minor_std >= min_minor_std_m) and (ratio >= min_width_ratio)
+
+    kept = df.loc[keep_mask].copy()
+    removed = df.loc[~keep_mask].copy()
+    removed["remove_reason"] = "linear_transit"
+
+    kept["minor_std_m"] = minor_stds[keep_mask]
+    kept["width_ratio"] = width_ratios[keep_mask]
+
+    return kept.reset_index(drop=True), removed.reset_index(drop=True)
+
+
 def keep_farm_clusters(df: pd.DataFrame, eps_m: float, min_samples: int):
     dense_df = df[df["is_dense"]].copy()
     sparse_removed = df[~df["is_dense"]].copy()
@@ -362,10 +416,20 @@ def calculate_farm_area_from_df(
     df1 = add_track_features(df1)
 
     df2 = mark_dense_points(df1, density_radius_m, min_neighbors)
-    farm_df, rem2 = keep_farm_clusters(df2, dbscan_eps_m, dbscan_min_samples)
+
+    # NEW: remove narrow road/transit style points
+    df3, rem_linear = remove_linear_transit_points(
+        df2,
+        radius_m=max(density_radius_m, 12.0),
+        min_neighbors=max(min_neighbors, 8),
+        min_minor_std_m=2.0,
+        min_width_ratio=0.12,
+    )
+
+    farm_df, rem2 = keep_farm_clusters(df3, dbscan_eps_m, dbscan_min_samples)
 
     if farm_df.empty:
-        removed = pd.concat([rem1, rem2], ignore_index=True)
+        removed = pd.concat([rem1, rem_linear, rem2], ignore_index=True)
         return {
             "all_df": all_df,
             "clean_df": farm_df,
@@ -387,7 +451,7 @@ def calculate_farm_area_from_df(
         contamination=lof_contamination
     )
 
-    removed = pd.concat([rem1, rem2, rem3], ignore_index=True)
+    removed = pd.concat([rem1, rem_linear, rem2, rem3], ignore_index=True)
 
     if farm_df.empty:
         return {
