@@ -144,8 +144,8 @@ def remove_linear_transit_points(
     df: pd.DataFrame,
     radius_m: float = 12.0,
     min_neighbors: int = 8,
-    min_minor_std_m: float = 2.0,
-    min_width_ratio: float = 0.12,
+    min_minor_std_m: float = 2.5,
+    min_width_ratio: float = 0.15,
 ):
     """
     Remove narrow line-like paths such as road/transit.
