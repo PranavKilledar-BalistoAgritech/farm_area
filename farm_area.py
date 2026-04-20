@@ -6,7 +6,7 @@ from pyproj import Transformer
 from shapely.geometry import Point, LineString
 from shapely.ops import unary_union
 from sklearn.cluster import DBSCAN
-from sklearn.neighbors import NearestNeighbors, LocalOutlierFactor
+from sklearn.neighbors import LocalOutlierFactor
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -127,56 +127,93 @@ def remove_gross_jump_outliers(df: pd.DataFrame, max_jump_m: float):
 
 
 def mark_dense_points(df: pd.DataFrame, radius_m: float, min_neighbors: int) -> pd.DataFrame:
+    """
+    Simple local density using grid-friendly neighborhood count.
+    """
     df = df.copy()
     coords = df[["x", "y"]].values
+    n = len(df)
 
-    nn = NearestNeighbors(radius=radius_m)
-    nn.fit(coords)
-    neigh_ind = nn.radius_neighbors(coords, return_distance=False)
+    counts = np.zeros(n, dtype=int)
+    r2 = radius_m * radius_m
 
-    neighbor_count = np.array([len(ix) - 1 for ix in neigh_ind])
-    df["neighbor_count"] = neighbor_count
+    # chunked pairwise counting to avoid heavy memory spikes
+    chunk = 1000
+    for start in range(0, n, chunk):
+        end = min(n, start + chunk)
+        sub = coords[start:end]
+        dx = sub[:, None, 0] - coords[None, :, 0]
+        dy = sub[:, None, 1] - coords[None, :, 1]
+        dist2 = dx * dx + dy * dy
+        counts[start:end] = (dist2 <= r2).sum(axis=1) - 1
+
+    df["neighbor_count"] = counts
     df["is_dense"] = df["neighbor_count"] >= min_neighbors
     return df
 
 
-def keep_hotspot_runs(
+def keep_revisit_farm_runs(
     df: pd.DataFrame,
-    hotspot_radius_m: float = 6.0,
-    hotspot_min_neighbors: int = 18,
-    min_run_points: int = 25,
+    cell_size_m: float = 2.0,
+    neighborhood_cells: int = 1,
+    min_local_revisit_score: int = 18,
+    min_cell_visits: int = 3,
+    min_run_points: int = 20,
     expand_points: int = 20,
 ):
     """
-    Keep only trajectory sections that belong to repeatedly visited local areas.
-    This helps preserve actual farm-working strips while removing one-time road transit.
+    Strong farm-vs-road logic:
+    - Convert points to small grid cells
+    - Count revisits per cell
+    - Also count revisits in neighboring cells
+    - Keep only trajectory runs where local revisit score is high
+
+    Why this works:
+    - Farm work revisits the same local area many times
+    - Road transit usually passes through cells only once or a few times
     """
     if df.empty:
         return df.copy(), df.copy()
 
     df = df.copy()
-    coords = df[["x", "y"]].values
 
-    nn = NearestNeighbors(radius=hotspot_radius_m)
-    nn.fit(coords)
-    neigh_ind = nn.radius_neighbors(coords, return_distance=False)
+    min_x = df["x"].min()
+    min_y = df["y"].min()
 
-    local_counts = np.array([len(ix) - 1 for ix in neigh_ind])
-    df["hotspot_neighbor_count"] = local_counts
-    df["is_hotspot"] = df["hotspot_neighbor_count"] >= hotspot_min_neighbors
+    df["gx"] = np.floor((df["x"] - min_x) / cell_size_m).astype(int)
+    df["gy"] = np.floor((df["y"] - min_y) / cell_size_m).astype(int)
 
-    hotspot_idx = np.where(df["is_hotspot"].values)[0]
+    cell_counts = df.groupby(["gx", "gy"]).size().to_dict()
+    df["cell_visit_count"] = [cell_counts[(gx, gy)] for gx, gy in zip(df["gx"], df["gy"])]
 
-    if len(hotspot_idx) == 0:
+    local_scores = []
+    strong_revisit_flags = []
+
+    for gx, gy, cell_visits in zip(df["gx"], df["gy"], df["cell_visit_count"]):
+        total = 0
+        for dx in range(-neighborhood_cells, neighborhood_cells + 1):
+            for dy in range(-neighborhood_cells, neighborhood_cells + 1):
+                total += cell_counts.get((gx + dx, gy + dy), 0)
+        local_scores.append(total)
+
+        strong_revisit = (cell_visits >= min_cell_visits) or (total >= min_local_revisit_score)
+        strong_revisit_flags.append(strong_revisit)
+
+    df["local_revisit_score"] = local_scores
+    df["is_revisit_farm"] = strong_revisit_flags
+
+    farm_idx = np.where(df["is_revisit_farm"].values)[0]
+
+    if len(farm_idx) == 0:
         removed = df.copy()
-        removed["remove_reason"] = "not_hotspot"
+        removed["remove_reason"] = "not_revisit_farm"
         return df.iloc[0:0].copy(), removed
 
     runs = []
-    start = hotspot_idx[0]
-    prev = hotspot_idx[0]
+    start = farm_idx[0]
+    prev = farm_idx[0]
 
-    for idx in hotspot_idx[1:]:
+    for idx in farm_idx[1:]:
         if idx == prev + 1:
             prev = idx
         else:
@@ -196,7 +233,7 @@ def keep_hotspot_runs(
 
     kept = df.loc[keep_mask].copy()
     removed = df.loc[~keep_mask].copy()
-    removed["remove_reason"] = "not_hotspot_run"
+    removed["remove_reason"] = "not_revisit_farm_run"
 
     return kept.reset_index(drop=True), removed.reset_index(drop=True)
 
@@ -424,18 +461,21 @@ def calculate_farm_area_from_df(
 
     df2 = mark_dense_points(df1, density_radius_m, min_neighbors)
 
-    df3, rem_hotspot = keep_hotspot_runs(
+    # Strong farm logic based on repeated occupancy of same/surrounding cells
+    df3, rem_revisit = keep_revisit_farm_runs(
         df2,
-        hotspot_radius_m=6.0,
-        hotspot_min_neighbors=18,
-        min_run_points=25,
+        cell_size_m=2.0,
+        neighborhood_cells=1,
+        min_local_revisit_score=18,
+        min_cell_visits=3,
+        min_run_points=20,
         expand_points=20,
     )
 
     farm_df, rem2 = keep_farm_clusters(df3, dbscan_eps_m, dbscan_min_samples)
 
     if farm_df.empty:
-        removed = pd.concat([rem1, rem_hotspot, rem2], ignore_index=True)
+        removed = pd.concat([rem1, rem_revisit, rem2], ignore_index=True)
         return {
             "all_df": all_df,
             "clean_df": farm_df,
@@ -457,7 +497,7 @@ def calculate_farm_area_from_df(
         contamination=lof_contamination
     )
 
-    removed = pd.concat([rem1, rem_hotspot, rem2, rem3], ignore_index=True)
+    removed = pd.concat([rem1, rem_revisit, rem2, rem3], ignore_index=True)
 
     if farm_df.empty:
         return {
