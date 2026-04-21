@@ -1,13 +1,13 @@
 import traceback
 
-import streamlit as st
 import folium
+import streamlit as st
 from streamlit_folium import st_folium
 
 from farm_area import (
-    read_uploaded_file,
     calculate_farm_area_from_df,
     geom_to_geojson_coords,
+    read_uploaded_file,
 )
 
 st.set_page_config(page_title="Farm Area Calculator", layout="wide")
@@ -25,7 +25,13 @@ def render_map(result):
         else result["all_df"]["longitude"].mean()
     )
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=18, tiles=None)
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=22,
+        max_zoom=24,
+        control_scale=True,
+        tiles=None,
+    )
 
     folium.TileLayer(
         tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
@@ -33,6 +39,8 @@ def render_map(result):
         name="Satellite",
         overlay=False,
         control=True,
+        max_zoom=24,
+        max_native_zoom=21,
     ).add_to(m)
 
     if not result["removed_df"].empty:
@@ -87,22 +95,35 @@ def render_map(result):
         ).add_to(m)
 
     folium.LayerControl().add_to(m)
+
+    if not result["clean_df"].empty:
+        min_lat = result["clean_df"]["latitude"].min()
+        max_lat = result["clean_df"]["latitude"].max()
+        min_lon = result["clean_df"]["longitude"].min()
+        max_lon = result["clean_df"]["longitude"].max()
+
+        pad_lat = max((max_lat - min_lat) * 0.08, 0.00005)
+        pad_lon = max((max_lon - min_lon) * 0.08, 0.00005)
+
+        m.fit_bounds([
+            [min_lat - pad_lat, min_lon - pad_lon],
+            [max_lat + pad_lat, max_lon + pad_lon],
+        ])
+
     return m
 
 
 try:
     st.title("Farm Area Calculator")
-    st.caption("Upload telemetry lat/lon data and calculate farm covered area in guntha.")
+    st.caption("Upload telemetry lat/lon + RPM data and calculate farm covered area in guntha.")
 
     with st.sidebar:
         st.header("Inputs")
 
-        work_width_ft = st.number_input("Working width (ft)", min_value=1.0, value=4.0, step=0.5)
+        work_width_ft = st.number_input("Working width (ft)", min_value=1.0, value=4.0, step=0.1)
         max_point_jump_m = st.number_input("Max point jump (m)", min_value=1.0, value=25.0, step=1.0)
-        density_radius_m = st.number_input("Density radius (m)", min_value=1.0, value=10.0, step=1.0)
-        min_neighbors = st.number_input("Min neighbors", min_value=1, value=8, step=1)
-        dbscan_eps_m = st.number_input("DBSCAN eps (m)", min_value=1.0, value=12.0, step=1.0)
-        dbscan_min_samples = st.number_input("DBSCAN min samples", min_value=2, value=10, step=1)
+        dbscan_eps_m = st.number_input("DBSCAN eps (m)", min_value=1.0, value=15.0, step=1.0)
+        dbscan_min_samples = st.number_input("DBSCAN min samples", min_value=2, value=15, step=1)
         lof_neighbors = st.number_input("LOF neighbors", min_value=2, value=20, step=1)
         lof_contamination = st.slider("LOF contamination", min_value=0.0, max_value=0.20, value=0.03, step=0.01)
 
@@ -118,7 +139,7 @@ try:
     )
 
     if uploaded_file is None:
-        st.info("Upload a CSV or Excel file with latitude, longitude, and optional timestamp.")
+        st.info("Upload a CSV/XLSX file with: lat, long, left rpm, right rpm, rotor rpm. Timestamp is optional.")
         st.stop()
 
     input_df = read_uploaded_file(uploaded_file)
@@ -128,8 +149,6 @@ try:
         input_df=input_df,
         work_width_ft=work_width_ft,
         max_point_jump_m=max_point_jump_m,
-        density_radius_m=density_radius_m,
-        min_neighbors=int(min_neighbors),
         dbscan_eps_m=dbscan_eps_m,
         dbscan_min_samples=int(dbscan_min_samples),
         lof_neighbors=int(lof_neighbors),
@@ -153,7 +172,7 @@ try:
         st.subheader("Filtered GPS map")
         try:
             m = render_map(result)
-            st_folium(m, width=1400, height=650, returned_objects=[])
+            st_folium(m, width=1400, height=700, returned_objects=[])
         except Exception as map_error:
             st.warning(f"Map rendering failed: {map_error}")
             st.code(traceback.format_exc())
@@ -166,7 +185,7 @@ try:
         if result["clean_df"].empty:
             st.info("No filtered farm points")
         else:
-            cols = [c for c in ["latitude", "longitude", "timestamp"] if c in result["clean_df"].columns]
+            cols = [c for c in ["latitude", "longitude", "left_rpm", "right_rpm", "rotor_rpm", "timestamp"] if c in result["clean_df"].columns]
             st.dataframe(result["clean_df"][cols], use_container_width=True)
 
     with p2:
@@ -174,7 +193,7 @@ try:
         if result["removed_df"].empty:
             st.info("No removed points")
         else:
-            cols = [c for c in ["latitude", "longitude", "timestamp", "remove_reason"] if c in result["removed_df"].columns]
+            cols = [c for c in ["latitude", "longitude", "left_rpm", "right_rpm", "rotor_rpm", "timestamp", "remove_reason"] if c in result["removed_df"].columns]
             st.dataframe(result["removed_df"][cols], use_container_width=True)
 
     clean_csv = result["clean_df"].to_csv(index=False).encode("utf-8")
