@@ -438,12 +438,22 @@ def split_into_segments(
     return segments
 
 
-def build_path_buffer_area(segments: List[pd.DataFrame], work_width_ft: float):
+def build_path_buffer_area(
+    segments: List[pd.DataFrame],
+    work_width_ft: float,
+    effective_width_factor: float = 0.90,
+    simplify_tolerance_m: float = 0.75,
+):
+    """
+    More accurate worked strip area:
+    - use effective width instead of nominal width
+    - simplify path slightly to reduce GPS jitter overcount
+    """
     if not segments:
         return None
 
-    work_width_m = work_width_ft * 0.3048
-    half_width = work_width_m / 2.0
+    effective_width_m = work_width_ft * 0.3048 * effective_width_factor
+    half_width = effective_width_m / 2.0
     polys = []
 
     for seg in segments:
@@ -460,7 +470,19 @@ def build_path_buffer_area(segments: List[pd.DataFrame], work_width_ft: float):
             continue
 
         line = LineString(dedup)
-        poly = line.buffer(half_width, cap_style=2, join_style=2)
+
+        if simplify_tolerance_m > 0:
+            line = line.simplify(simplify_tolerance_m, preserve_topology=False)
+
+        if line.is_empty or line.length == 0:
+            continue
+
+        poly = line.buffer(
+            half_width,
+            cap_style=2,
+            join_style=2,
+        )
+
         if not poly.is_empty:
             polys.append(poly)
 
@@ -665,7 +687,13 @@ def calculate_farm_area_from_df(
         max_gap_sec=max_segment_time_sec,
         min_segment_points=min_segment_points,
     )
-    path_geom = build_path_buffer_area(segments, work_width_ft)
+
+    path_geom = build_path_buffer_area(
+        segments,
+        work_width_ft=work_width_ft,
+        effective_width_factor=0.90,
+        simplify_tolerance_m=0.75,
+    )
 
     concave_area_m2 = concave_geom.area if concave_geom is not None else 0.0
     path_area_m2 = path_geom.area if path_geom is not None else 0.0
