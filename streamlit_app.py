@@ -1,6 +1,7 @@
 import traceback
 
 import folium
+import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
@@ -11,6 +12,68 @@ from farm_area import (
 )
 
 st.set_page_config(page_title="Farm Area Calculator", layout="wide")
+
+
+def build_line_segments(df, max_gap_m=20.0, max_gap_sec=180.0):
+    if df is None or df.empty:
+        return []
+
+    work = df.copy()
+
+    if "timestamp" in work.columns:
+        work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce")
+    else:
+        work["timestamp"] = pd.NaT
+
+    if work["timestamp"].notna().any():
+        work = work.sort_values("timestamp").reset_index(drop=True)
+    else:
+        work = work.reset_index(drop=True)
+
+    segments = []
+    current_segment = []
+    prev = None
+
+    for _, row in work.iterrows():
+        point = [row["latitude"], row["longitude"]]
+
+        if prev is None:
+            current_segment = [point]
+            prev = row
+            continue
+
+        too_far = False
+        if all(col in work.columns for col in ["x", "y"]):
+            if pd.notna(prev["x"]) and pd.notna(prev["y"]) and pd.notna(row["x"]) and pd.notna(row["y"]):
+                dist_m = ((row["x"] - prev["x"]) ** 2 + (row["y"] - prev["y"]) ** 2) ** 0.5
+                too_far = dist_m > max_gap_m
+
+        too_old = False
+        if pd.notna(prev["timestamp"]) and pd.notna(row["timestamp"]):
+            gap_sec = (row["timestamp"] - prev["timestamp"]).total_seconds()
+            too_old = gap_sec > max_gap_sec
+
+        cluster_changed = False
+        if "cluster_id" in work.columns:
+            cluster_changed = row["cluster_id"] != prev["cluster_id"]
+
+        reason_changed = False
+        if "remove_reason" in work.columns:
+            reason_changed = row["remove_reason"] != prev["remove_reason"]
+
+        if too_far or too_old or cluster_changed or reason_changed:
+            if len(current_segment) >= 2:
+                segments.append(current_segment)
+            current_segment = [point]
+        else:
+            current_segment.append(point)
+
+        prev = row
+
+    if len(current_segment) >= 2:
+        segments.append(current_segment)
+
+    return segments
 
 
 def render_map(result):
@@ -44,27 +107,34 @@ def render_map(result):
     ).add_to(m)
 
     if not result["removed_df"].empty:
-        fg_removed = folium.FeatureGroup(name="Removed points", show=True)
-        for _, r in result["removed_df"].iterrows():
-            folium.CircleMarker(
-                location=[r["latitude"], r["longitude"]],
-                radius=2,
+        fg_removed = folium.FeatureGroup(name="Removed lines", show=True)
+        removed_segments = build_line_segments(
+            result["removed_df"],
+            max_gap_m=20.0,
+            max_gap_sec=180.0,
+        )
+        for seg in removed_segments:
+            folium.PolyLine(
+                locations=seg,
                 color="red",
-                fill=True,
-                fill_opacity=0.8,
-                popup=str(r.get("remove_reason", "removed")),
+                weight=3,
+                opacity=0.9,
             ).add_to(fg_removed)
         fg_removed.add_to(m)
 
     if not result["clean_df"].empty:
-        fg_clean = folium.FeatureGroup(name="Filtered farm points", show=True)
-        for _, r in result["clean_df"].iterrows():
-            folium.CircleMarker(
-                location=[r["latitude"], r["longitude"]],
-                radius=2,
+        fg_clean = folium.FeatureGroup(name="Filtered farm lines", show=True)
+        clean_segments = build_line_segments(
+            result["clean_df"],
+            max_gap_m=20.0,
+            max_gap_sec=180.0,
+        )
+        for seg in clean_segments:
+            folium.PolyLine(
+                locations=seg,
                 color="lime",
-                fill=True,
-                fill_opacity=0.9,
+                weight=3,
+                opacity=0.95,
             ).add_to(fg_clean)
         fg_clean.add_to(m)
 
