@@ -1,3 +1,4 @@
+import math
 import traceback
 
 import folium
@@ -14,7 +15,21 @@ from farm_area import (
 st.set_page_config(page_title="Farm Area Calculator", layout="wide")
 
 
-def build_line_segments(df, max_gap_m=20.0, max_gap_sec=180.0):
+def haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dp / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    )
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def build_line_segments(df, max_gap_m=20.0, max_gap_sec=180.0, min_segment_points=2):
     if df is None or df.empty:
         return []
 
@@ -30,39 +45,36 @@ def build_line_segments(df, max_gap_m=20.0, max_gap_sec=180.0):
     else:
         work = work.reset_index(drop=True)
 
+    work = work.dropna(subset=["latitude", "longitude"]).copy()
+    if work.empty:
+        return []
+
     segments = []
     current_segment = []
     prev = None
 
     for _, row in work.iterrows():
-        point = [row["latitude"], row["longitude"]]
+        point = [float(row["latitude"]), float(row["longitude"])]
 
         if prev is None:
             current_segment = [point]
             prev = row
             continue
 
-        too_far = False
-        if all(col in work.columns for col in ["x", "y"]):
-            if pd.notna(prev["x"]) and pd.notna(prev["y"]) and pd.notna(row["x"]) and pd.notna(row["y"]):
-                dist_m = ((row["x"] - prev["x"]) ** 2 + (row["y"] - prev["y"]) ** 2) ** 0.5
-                too_far = dist_m > max_gap_m
+        dist_m = haversine_m(
+            prev["latitude"], prev["longitude"],
+            row["latitude"], row["longitude"]
+        )
+
+        too_far = dist_m > max_gap_m
 
         too_old = False
         if pd.notna(prev["timestamp"]) and pd.notna(row["timestamp"]):
             gap_sec = (row["timestamp"] - prev["timestamp"]).total_seconds()
             too_old = gap_sec > max_gap_sec
 
-        cluster_changed = False
-        if "cluster_id" in work.columns:
-            cluster_changed = row["cluster_id"] != prev["cluster_id"]
-
-        reason_changed = False
-        if "remove_reason" in work.columns:
-            reason_changed = row["remove_reason"] != prev["remove_reason"]
-
-        if too_far or too_old or cluster_changed or reason_changed:
-            if len(current_segment) >= 2:
+        if too_far or too_old:
+            if len(current_segment) >= min_segment_points:
                 segments.append(current_segment)
             current_segment = [point]
         else:
@@ -70,23 +82,52 @@ def build_line_segments(df, max_gap_m=20.0, max_gap_sec=180.0):
 
         prev = row
 
-    if len(current_segment) >= 2:
+    if len(current_segment) >= min_segment_points:
         segments.append(current_segment)
 
     return segments
 
 
+def classify_on_road_points(df, wheel_th=20.0, rotor_th=50.0):
+    if df is None or df.empty:
+        return df.iloc[0:0].copy()
+
+    needed = {"left_rpm", "right_rpm", "rotor_rpm"}
+    if not needed.issubset(df.columns):
+        return df.iloc[0:0].copy()
+
+    out = df.copy()
+
+    out["left_rpm"] = pd.to_numeric(out["left_rpm"], errors="coerce").fillna(0)
+    out["right_rpm"] = pd.to_numeric(out["right_rpm"], errors="coerce").fillna(0)
+    out["rotor_rpm"] = pd.to_numeric(out["rotor_rpm"], errors="coerce").fillna(0)
+
+    mask = (
+        (out["rotor_rpm"] <= rotor_th)
+        & (
+            (out["left_rpm"] > wheel_th)
+            | (out["right_rpm"] > wheel_th)
+        )
+    )
+
+    return out.loc[mask].copy()
+
+
+def remove_rows_by_row_id(df, row_ids_to_remove):
+    if df is None or df.empty:
+        return df.iloc[0:0].copy()
+
+    if "row_id" not in df.columns:
+        return df.copy()
+
+    return df.loc[~df["row_id"].isin(row_ids_to_remove)].copy()
+
+
 def render_map(result):
-    center_lat = (
-        result["clean_df"]["latitude"].mean()
-        if not result["clean_df"].empty
-        else result["all_df"]["latitude"].mean()
-    )
-    center_lon = (
-        result["clean_df"]["longitude"].mean()
-        if not result["clean_df"].empty
-        else result["all_df"]["longitude"].mean()
-    )
+    center_source = result["clean_df"] if not result["clean_df"].empty else result["all_df"]
+
+    center_lat = center_source["latitude"].mean()
+    center_lon = center_source["longitude"].mean()
 
     m = folium.Map(
         location=[center_lat, center_lon],
@@ -106,48 +147,75 @@ def render_map(result):
         max_native_zoom=21,
     ).add_to(m)
 
-    if not result["removed_df"].empty:
-        fg_removed = folium.FeatureGroup(name="Removed lines", show=True)
-        removed_segments = build_line_segments(
-            result["removed_df"],
-            max_gap_m=20.0,
-            max_gap_sec=180.0,
-        )
-        for seg in removed_segments:
-            folium.PolyLine(
-                locations=seg,
-                color="red",
-                weight=3,
-                opacity=0.9,
-            ).add_to(fg_removed)
-        fg_removed.add_to(m)
+    all_df = result["all_df"].copy()
+    clean_df = result["clean_df"].copy()
+    removed_df = result["removed_df"].copy()
 
-    if not result["clean_df"].empty:
-        fg_clean = folium.FeatureGroup(name="Filtered farm lines", show=True)
-        clean_segments = build_line_segments(
-            result["clean_df"],
+    on_road_df = classify_on_road_points(all_df, wheel_th=20.0, rotor_th=50.0)
+
+    on_road_row_ids = set(on_road_df["row_id"].tolist()) if "row_id" in on_road_df.columns else set()
+    removed_display_df = remove_rows_by_row_id(removed_df, on_road_row_ids)
+
+    if not clean_df.empty:
+        fg_farm = folium.FeatureGroup(name="On_Farm", show=True)
+        farm_segments = build_line_segments(
+            clean_df,
             max_gap_m=20.0,
             max_gap_sec=180.0,
+            min_segment_points=2,
         )
-        for seg in clean_segments:
+        for seg in farm_segments:
             folium.PolyLine(
                 locations=seg,
                 color="lime",
                 weight=3,
                 opacity=0.95,
-            ).add_to(fg_clean)
-        fg_clean.add_to(m)
+            ).add_to(fg_farm)
+        fg_farm.add_to(m)
+
+    if not on_road_df.empty:
+        fg_road = folium.FeatureGroup(name="On_Road", show=True)
+        road_segments = build_line_segments(
+            on_road_df,
+            max_gap_m=25.0,
+            max_gap_sec=180.0,
+            min_segment_points=2,
+        )
+        for seg in road_segments:
+            folium.PolyLine(
+                locations=seg,
+                color="yellow",
+                weight=3,
+                opacity=0.95,
+            ).add_to(fg_road)
+        fg_road.add_to(m)
+
+    if not removed_display_df.empty:
+        fg_removed = folium.FeatureGroup(name="Removed_Points", show=True)
+        for _, r in removed_display_df.iterrows():
+            if pd.notna(r.get("latitude")) and pd.notna(r.get("longitude")):
+                popup_text = str(r.get("remove_reason", "removed"))
+                folium.CircleMarker(
+                    location=[float(r["latitude"]), float(r["longitude"])],
+                    radius=2,
+                    color="red",
+                    fill=True,
+                    fill_color="red",
+                    fill_opacity=0.85,
+                    popup=popup_text,
+                ).add_to(fg_removed)
+        fg_removed.add_to(m)
 
     concave_gj = geom_to_geojson_coords(result["concave_geom"], result["to_wgs"])
     if concave_gj:
         folium.GeoJson(
             concave_gj,
-            name="Concave farm boundary",
+            name="Farm_Boundary",
             style_function=lambda x: {
                 "color": "yellow",
                 "weight": 2,
                 "fillColor": "yellow",
-                "fillOpacity": 0.25,
+                "fillOpacity": 0.20,
             },
         ).add_to(m)
 
@@ -155,22 +223,23 @@ def render_map(result):
     if path_gj:
         folium.GeoJson(
             path_gj,
-            name="4ft worked strip",
+            name="Worked_Strip",
             style_function=lambda x: {
                 "color": "cyan",
                 "weight": 2,
                 "fillColor": "cyan",
-                "fillOpacity": 0.20,
+                "fillOpacity": 0.18,
             },
         ).add_to(m)
 
-    folium.LayerControl().add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
 
-    if not result["clean_df"].empty:
-        min_lat = result["clean_df"]["latitude"].min()
-        max_lat = result["clean_df"]["latitude"].max()
-        min_lon = result["clean_df"]["longitude"].min()
-        max_lon = result["clean_df"]["longitude"].max()
+    bounds_df = result["all_df"] if not result["all_df"].empty else center_source
+    if not bounds_df.empty:
+        min_lat = bounds_df["latitude"].min()
+        max_lat = bounds_df["latitude"].max()
+        min_lon = bounds_df["longitude"].min()
+        max_lon = bounds_df["longitude"].max()
 
         pad_lat = max((max_lat - min_lat) * 0.08, 0.00005)
         pad_lon = max((max_lon - min_lon) * 0.08, 0.00005)
@@ -233,13 +302,19 @@ try:
     c2.metric("Covered area (m²)", f"{result['concave_area_m2']:.2f}")
     c3.metric("4 ft strip check (guntha)", f"{result['path_area_guntha']:.4f}")
 
-    d1, d2, d3 = st.columns(3)
+    on_road_preview = classify_on_road_points(result["all_df"], wheel_th=20.0, rotor_th=50.0)
+    on_road_row_ids = set(on_road_preview["row_id"].tolist()) if "row_id" in on_road_preview.columns else set()
+    removed_preview = remove_rows_by_row_id(result["removed_df"], on_road_row_ids)
+
+    d1, d2, d3, d4 = st.columns(4)
     d1.metric("Total points", len(result["all_df"]))
-    d2.metric("Filtered farm points", len(result["clean_df"]))
-    d3.metric("Removed points", len(result["removed_df"]))
+    d2.metric("On_Farm points", len(result["clean_df"]))
+    d3.metric("On_Road points", len(on_road_preview))
+    d4.metric("Removed points", len(removed_preview))
 
     if show_map:
         st.subheader("Filtered GPS map")
+        st.caption("Use the layer control on the map to toggle On_Farm, On_Road, Removed_Points, Farm_Boundary, and Worked_Strip.")
         try:
             m = render_map(result)
             st_folium(m, width=1400, height=700, returned_objects=[])
@@ -248,40 +323,58 @@ try:
             st.code(traceback.format_exc())
 
     st.subheader("Preview")
-    p1, p2 = st.columns(2)
+    p1, p2, p3 = st.columns(3)
 
     with p1:
-        st.write("Filtered farm points")
+        st.write("On_Farm points")
         if result["clean_df"].empty:
-            st.info("No filtered farm points")
+            st.info("No On_Farm points")
         else:
             cols = [c for c in ["latitude", "longitude", "left_rpm", "right_rpm", "rotor_rpm", "timestamp"] if c in result["clean_df"].columns]
             st.dataframe(result["clean_df"][cols], use_container_width=True)
 
     with p2:
-        st.write("Removed points")
-        if result["removed_df"].empty:
-            st.info("No removed points")
+        st.write("On_Road points")
+        if on_road_preview.empty:
+            st.info("No On_Road points")
         else:
-            cols = [c for c in ["latitude", "longitude", "left_rpm", "right_rpm", "rotor_rpm", "timestamp", "remove_reason"] if c in result["removed_df"].columns]
-            st.dataframe(result["removed_df"][cols], use_container_width=True)
+            cols = [c for c in ["latitude", "longitude", "left_rpm", "right_rpm", "rotor_rpm", "timestamp"] if c in on_road_preview.columns]
+            st.dataframe(on_road_preview[cols], use_container_width=True)
+
+    with p3:
+        st.write("Removed points")
+        if removed_preview.empty:
+            st.info("No Removed points")
+        else:
+            cols = [c for c in ["latitude", "longitude", "left_rpm", "right_rpm", "rotor_rpm", "timestamp", "remove_reason"] if c in removed_preview.columns]
+            st.dataframe(removed_preview[cols], use_container_width=True)
 
     clean_csv = result["clean_df"].to_csv(index=False).encode("utf-8")
-    removed_csv = result["removed_df"].to_csv(index=False).encode("utf-8")
+    on_road_csv = on_road_preview.to_csv(index=False).encode("utf-8")
+    removed_csv = removed_preview.to_csv(index=False).encode("utf-8")
 
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     with b1:
         st.download_button(
-            "Download filtered farm points CSV",
+            "Download On_Farm CSV",
             data=clean_csv,
-            file_name="cleaned_farm_points.csv",
+            file_name="on_farm_points.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
     with b2:
         st.download_button(
-            "Download removed points CSV",
+            "Download On_Road CSV",
+            data=on_road_csv,
+            file_name="on_road_points.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with b3:
+        st.download_button(
+            "Download Removed CSV",
             data=removed_csv,
             file_name="removed_points.csv",
             mime="text/csv",
