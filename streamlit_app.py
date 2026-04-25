@@ -264,7 +264,7 @@ try:
         dbscan_eps_m = st.number_input("DBSCAN eps (m)", min_value=1.0, value=15.0, step=1.0)
         dbscan_min_samples = st.number_input("DBSCAN min samples", min_value=2, value=15, step=1)
         lof_neighbors = st.number_input("LOF neighbors", min_value=2, value=20, step=1)
-        lof_contamination = st.slider("LOF contamination", min_value=0.0, max_value=0.20, value=0.03, step=0.01)
+        lof_contamination = st.slider("LOF contamination", min_value=0.0, max_value=0.20, value=0.01, step=0.01)
 
         point_buffer_m = st.number_input("Boundary point buffer (m)", min_value=0.5, value=2.2, step=0.1)
         boundary_smooth_m = st.number_input("Boundary smooth (m)", min_value=0.0, value=3.0, step=0.1)
