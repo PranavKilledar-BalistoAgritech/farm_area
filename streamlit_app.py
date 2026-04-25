@@ -297,8 +297,7 @@ try:
         boundary_erode_m=boundary_erode_m,
     )
 
-c1 = st.columns(1)[0]
-c1.metric("4 ft strip check (guntha)", f"{result['path_area_guntha']:.4f}")
+    st.metric("4 ft strip check (guntha)", f"{result['path_area_guntha']:.4f}")
 
     on_road_preview = classify_on_road_points(result["all_df"], wheel_th=20.0, rotor_th=50.0)
     on_road_row_ids = set(on_road_preview["row_id"].tolist()) if "row_id" in on_road_preview.columns else set()
