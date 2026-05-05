@@ -243,9 +243,19 @@ def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
 
     m = folium.Map(
         location=[center_lat, center_lon],
-        zoom_start=19,
+        zoom_start=20,
+        max_zoom=22,
+        min_zoom=3,
         control_scale=True,
+        zoom_control=True,
         tiles=None,
+        prefer_canvas=True,
+        scrollWheelZoom=True,
+        doubleClickZoom=True,
+        dragging=True,
+        touchZoom=True,
+        boxZoom=True,
+        keyboard=True,
     )
 
     folium.TileLayer(
@@ -254,6 +264,7 @@ def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
         name="Satellite",
         overlay=False,
         control=True,
+        max_zoom=22,
     ).add_to(m)
 
     on_farm_layer = folium.FeatureGroup(name="On_Farm", show=True)
@@ -342,22 +353,17 @@ def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
             fill_opacity=0.18,
         )
 
-    try:
-        bounds = [
-            [float(valid_points[lat_col].min()), float(valid_points[lon_col].min())],
-            [float(valid_points[lat_col].max()), float(valid_points[lon_col].max())],
-        ]
-        m.fit_bounds(bounds)
-    except Exception:
-        pass
+    # Do not call m.fit_bounds() here.
+    # fit_bounds re-renders the map to full view and makes manual zoom feel like it is not working.
 
     folium.LayerControl(collapsed=False).add_to(m)
 
     st_folium(
         m,
         width="100%",
-        height=600,
+        height=750,
         returned_objects=[],
+        key="farm_map",
     )
 
 
