@@ -73,6 +73,157 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return r * c
 
 
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Bearing from first GPS point to second GPS point in degrees."""
+    if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
+        return None
+
+    lat1 = math.radians(float(lat1))
+    lat2 = math.radians(float(lat2))
+    dlon = math.radians(float(lon2) - float(lon1))
+
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+
+    brg = math.degrees(math.atan2(x, y))
+    return (brg + 360.0) % 360.0
+
+
+def angle_diff_deg(a, b):
+    """Smallest difference between two headings in degrees."""
+    if a is None or b is None:
+        return 0.0
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def get_strong_farm_points(df, wheel_th=20.0, rotor_th=50.0):
+    """
+    Map-only filter.
+    Keeps only real farm-working points: both wheels moving and rotor running.
+    This makes the map cleaner and avoids drawing turns/noise as farm sari lines.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    needed = {"left_rpm", "right_rpm", "rotor_rpm"}
+    if not needed.issubset(df.columns):
+        return df.copy()
+
+    out = df.copy()
+    out["left_rpm"] = pd.to_numeric(out["left_rpm"], errors="coerce").fillna(0)
+    out["right_rpm"] = pd.to_numeric(out["right_rpm"], errors="coerce").fillna(0)
+    out["rotor_rpm"] = pd.to_numeric(out["rotor_rpm"], errors="coerce").fillna(0)
+
+    mask = (
+        (out["left_rpm"].abs() > wheel_th)
+        & (out["right_rpm"].abs() > wheel_th)
+        & (out["rotor_rpm"].abs() > rotor_th)
+    )
+
+    return out.loc[mask].copy()
+
+
+def build_sari_line_segments(
+    df,
+    max_gap_m=25.0,
+    max_gap_sec=60.0,
+    max_heading_change_deg=35.0,
+    min_move_m=1.0,
+    min_segment_points=8,
+):
+    """
+    Build sari-wise straight farm lines for map presentation.
+
+    The normal GPS trail connects points by time only, which creates cross-lines.
+    This function connects points only when distance, time, and heading direction are valid.
+    If heading changes sharply, it starts a new sari line.
+    """
+    if df is None or df.empty:
+        return []
+
+    lat_col, lon_col = get_lat_lon_cols(df)
+    if lat_col is None or lon_col is None:
+        return []
+
+    work = df.copy()
+    work[lat_col] = pd.to_numeric(work[lat_col], errors="coerce")
+    work[lon_col] = pd.to_numeric(work[lon_col], errors="coerce")
+    work = work.dropna(subset=[lat_col, lon_col]).copy()
+
+    if work.empty:
+        return []
+
+    time_col = get_time_column(work)
+
+    if time_col:
+        work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+        if work[time_col].notna().any():
+            work = work.sort_values(time_col).reset_index(drop=True)
+        elif "row_id" in work.columns:
+            work = work.sort_values("row_id").reset_index(drop=True)
+    elif "row_id" in work.columns:
+        work = work.sort_values("row_id").reset_index(drop=True)
+    else:
+        work = work.reset_index(drop=True)
+
+    segments = []
+    current_segment = []
+    prev_row = None
+    last_heading = None
+
+    for _, row in work.iterrows():
+        lat = float(row[lat_col])
+        lon = float(row[lon_col])
+        point = [lat, lon]
+
+        if prev_row is None:
+            current_segment = [point]
+            prev_row = row
+            last_heading = None
+            continue
+
+        dist_m = haversine_m(prev_row[lat_col], prev_row[lon_col], lat, lon)
+
+        # Ignore very tiny movement points for line drawing; they create zig-zag noise.
+        if dist_m is not None and dist_m < min_move_m:
+            continue
+
+        curr_heading = bearing_deg(prev_row[lat_col], prev_row[lon_col], lat, lon)
+        start_new_segment = False
+
+        if dist_m is None or dist_m > max_gap_m:
+            start_new_segment = True
+
+        if time_col:
+            prev_time = prev_row.get(time_col)
+            curr_time = row.get(time_col)
+            if pd.notna(prev_time) and pd.notna(curr_time):
+                gap_sec = abs((curr_time - prev_time).total_seconds())
+                if gap_sec > max_gap_sec:
+                    start_new_segment = True
+
+        if last_heading is not None:
+            heading_change = angle_diff_deg(curr_heading, last_heading)
+            if heading_change > max_heading_change_deg:
+                start_new_segment = True
+
+        if start_new_segment:
+            if len(current_segment) >= int(min_segment_points):
+                segments.append(current_segment)
+            current_segment = [point]
+            last_heading = None
+        else:
+            current_segment.append(point)
+            last_heading = curr_heading
+
+        prev_row = row
+
+    if len(current_segment) >= int(min_segment_points):
+        segments.append(current_segment)
+
+    return segments
+
 def build_line_segments(
     df,
     max_gap_m=8.0,
@@ -218,7 +369,7 @@ def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
         pass
 
 
-def render_map(result, line_gap_m=25.0, line_gap_sec=60.0):
+def render_map(result, line_gap_m=25.0, line_gap_sec=60.0, line_heading_deg=35.0, line_min_move_m=1.0):
     """Render satellite map with clean segmented farm lines."""
     all_df = result.get("all_df", pd.DataFrame())
     clean_df = result.get("clean_df", pd.DataFrame())
@@ -271,11 +422,17 @@ def render_map(result, line_gap_m=25.0, line_gap_sec=60.0):
     on_road_layer = folium.FeatureGroup(name="On_Road", show=True)
     removed_layer = folium.FeatureGroup(name="Removed_Points", show=True)
 
-    # Green On_Farm lines
-    on_farm_segments = build_line_segments(
-        clean_df,
+    # Green On_Farm sari lines
+    # For map presentation, use only strong farm points and heading-based segmentation.
+    # This avoids random cross-connections and shows farm work as sari-wise straight lines.
+    map_farm_df = get_strong_farm_points(clean_df)
+
+    on_farm_segments = build_sari_line_segments(
+        map_farm_df,
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
+        max_heading_change_deg=line_heading_deg,
+        min_move_m=line_min_move_m,
         min_segment_points=8,
     )
 
@@ -471,6 +628,22 @@ line_gap_sec = st.sidebar.number_input(
     step=1.0,
 )
 
+line_heading_deg = st.sidebar.number_input(
+    "Map line max heading change (deg)",
+    min_value=5.0,
+    max_value=90.0,
+    value=35.0,
+    step=5.0,
+)
+
+line_min_move_m = st.sidebar.number_input(
+    "Map line minimum movement (m)",
+    min_value=0.1,
+    max_value=5.0,
+    value=1.0,
+    step=0.1,
+)
+
 show_map = st.sidebar.checkbox("Show map", value=True)
 
 
@@ -542,7 +715,7 @@ try:
         st.caption(
             "Use layer control to toggle On_Farm, On_Road, Removed_Points, Farm_Boundary, and Worked_Strip."
         )
-        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec)
+        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec, line_heading_deg=line_heading_deg, line_min_move_m=line_min_move_m)
 
     st.subheader("Data Preview")
 
