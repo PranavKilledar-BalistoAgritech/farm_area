@@ -423,9 +423,9 @@ def render_map(result, line_gap_m=25.0, line_gap_sec=60.0, line_heading_deg=35.0
     removed_layer = folium.FeatureGroup(name="Removed_Points", show=True)
 
     # Green On_Farm sari lines
-    # For map presentation, use only strong farm points and heading-based segmentation.
-    # This avoids random cross-connections and shows farm work as sari-wise straight lines.
-    map_farm_df = get_strong_farm_points(clean_df)
+    # For map presentation, use clean_df instead of only strong farm points.
+    # This keeps the complete sari lines visible while heading segmentation avoids random cross-connections.
+    map_farm_df = clean_df.copy()
 
     on_farm_segments = build_sari_line_segments(
         map_farm_df,
@@ -433,8 +433,18 @@ def render_map(result, line_gap_m=25.0, line_gap_sec=60.0, line_heading_deg=35.0
         max_gap_sec=line_gap_sec,
         max_heading_change_deg=line_heading_deg,
         min_move_m=line_min_move_m,
-        min_segment_points=8,
+        min_segment_points=3,
     )
+
+    # Fallback: if heading-based logic becomes too strict for any dataset,
+    # still show farm lines using distance/time segmentation.
+    if not on_farm_segments:
+        on_farm_segments = build_line_segments(
+            map_farm_df,
+            max_gap_m=line_gap_m,
+            max_gap_sec=line_gap_sec,
+            min_segment_points=3,
+        )
 
     for seg in on_farm_segments:
         folium.PolyLine(
@@ -450,7 +460,7 @@ def render_map(result, line_gap_m=25.0, line_gap_sec=60.0, line_heading_deg=35.0
         on_road_df,
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
-        min_segment_points=8,
+        min_segment_points=3,
     )
 
     for seg in on_road_segments:
@@ -624,7 +634,7 @@ line_gap_sec = st.sidebar.number_input(
     "Map line max time gap (sec)",
     min_value=2.0,
     max_value=180.0,
-    value=60.0,
+    value=90.0,
     step=1.0,
 )
 
@@ -632,7 +642,7 @@ line_heading_deg = st.sidebar.number_input(
     "Map line max heading change (deg)",
     min_value=5.0,
     max_value=90.0,
-    value=35.0,
+    value=60.0,
     step=5.0,
 )
 
@@ -640,7 +650,7 @@ line_min_move_m = st.sidebar.number_input(
     "Map line minimum movement (m)",
     min_value=0.1,
     max_value=5.0,
-    value=1.0,
+    value=0.5,
     step=0.1,
 )
 
