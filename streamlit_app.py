@@ -218,7 +218,7 @@ def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
         pass
 
 
-def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
+def render_map(result, line_gap_m=25.0, line_gap_sec=60.0):
     """Render satellite map with clean segmented farm lines."""
     all_df = result.get("all_df", pd.DataFrame())
     clean_df = result.get("clean_df", pd.DataFrame())
@@ -276,15 +276,15 @@ def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
         clean_df,
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
-        min_segment_points=3,
+        min_segment_points=8,
     )
 
     for seg in on_farm_segments:
         folium.PolyLine(
             locations=seg,
             color="lime",
-            weight=3,
-            opacity=0.9,
+            weight=5,
+            opacity=0.95,
         ).add_to(on_farm_layer)
 
     # Yellow On_Road lines
@@ -293,15 +293,15 @@ def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
         on_road_df,
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
-        min_segment_points=3,
+        min_segment_points=8,
     )
 
     for seg in on_road_segments:
         folium.PolyLine(
             locations=seg,
             color="yellow",
-            weight=3,
-            opacity=0.9,
+            weight=5,
+            opacity=0.95,
         ).add_to(on_road_layer)
 
     # Red removed points
@@ -458,16 +458,16 @@ st.sidebar.markdown("---")
 line_gap_m = st.sidebar.number_input(
     "Map line max gap (m)",
     min_value=2.0,
-    max_value=30.0,
-    value=8.0,
+    max_value=50.0,
+    value=25.0,
     step=1.0,
 )
 
 line_gap_sec = st.sidebar.number_input(
     "Map line max time gap (sec)",
     min_value=2.0,
-    max_value=120.0,
-    value=15.0,
+    max_value=180.0,
+    value=60.0,
     step=1.0,
 )
 
