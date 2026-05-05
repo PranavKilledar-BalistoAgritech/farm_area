@@ -226,9 +226,10 @@ def build_sari_line_segments(
 
 def build_line_segments(
     df,
-    max_gap_m=8.0,
-    max_gap_sec=15.0,
-    min_segment_points=3,
+    max_gap_m=25.0,
+    max_gap_sec=90.0,
+    min_segment_points=2,
+    max_row_gap=3,
 ):
     """
     Build clean GPS line segments.
@@ -290,6 +291,17 @@ def build_line_segments(
                 if gap_sec > max_gap_sec:
                     start_new_segment = True
 
+        # Very important for filtered data:
+        # if many original rows were removed between two points, do not connect them.
+        # This prevents wrong diagonal cross-lines across sari passes.
+        if "row_id" in work.columns and max_row_gap is not None:
+            try:
+                row_gap = abs(int(row.get("row_id")) - int(prev_row.get("row_id")))
+                if row_gap > int(max_row_gap):
+                    start_new_segment = True
+            except Exception:
+                pass
+
         if start_new_segment:
             if len(current_segment) >= int(min_segment_points):
                 segments.append(current_segment)
@@ -345,7 +357,7 @@ def remove_rows_by_row_id(source_df, remove_df):
     return source_df.loc[~source_df["row_id"].isin(remove_ids)].copy()
 
 
-def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
+def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity, show=False):
     """Add backend shapely geometry on map."""
     if geom is None or getattr(geom, "is_empty", True):
         return
@@ -358,6 +370,7 @@ def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
         folium.GeoJson(
             geojson_data,
             name=name,
+            show=show,
             style_function=lambda x: {
                 "color": color,
                 "weight": 2,
@@ -369,10 +382,11 @@ def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
         pass
 
 
-def render_map(result, line_gap_m=80.0, line_gap_sec=300.0):
-    """Render satellite map with timestamp-based farm lines.
+def render_map(result, line_gap_m=25.0, line_gap_sec=90.0, line_row_gap=3):
+    """Render satellite map with row-sequence farm lines.
 
-    Map display uses filtered farm points in timestamp order only.
+    Map display connects only points that are near in original data order.
+    This prevents long cross-lines after filtering removes turn/noise points.
     This is only for presentation and does not change area calculation.
     """
     all_df = result.get("all_df", pd.DataFrame())
@@ -423,24 +437,23 @@ def render_map(result, line_gap_m=80.0, line_gap_sec=300.0):
     ).add_to(m)
 
     on_farm_layer = folium.FeatureGroup(name="On_Farm", show=True)
-    on_road_layer = folium.FeatureGroup(name="On_Road", show=True)
-    removed_layer = folium.FeatureGroup(name="Removed_Points", show=True)
+    on_road_layer = folium.FeatureGroup(name="On_Road", show=False)
+    removed_layer = folium.FeatureGroup(name="Removed_Points", show=False)
 
     # Green On_Farm lines
-    # Presentation logic: join filtered farm points only in timestamp/order sequence.
-    # Do not use heading filtering here, because GPS jitter breaks the sari lines.
-    # Use all raw On_Farm RPM points first so complete sari movement is visible.
-    map_farm_df = get_strong_farm_points(all_df)
+    # Use backend-filtered clean_df for map display.
+    # Important: connect only near-by row_id points so filtered gaps do not become cross-lines.
+    map_farm_df = clean_df.copy()
 
-    # If RPM columns are missing or the strict RPM filter returns nothing, fall back to clean_df.
     if map_farm_df is None or map_farm_df.empty:
-        map_farm_df = clean_df.copy()
+        map_farm_df = get_strong_farm_points(all_df)
 
     on_farm_segments = build_line_segments(
         map_farm_df,
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
         min_segment_points=2,
+        max_row_gap=line_row_gap,
     )
 
     for seg in on_farm_segments:
@@ -458,6 +471,7 @@ def render_map(result, line_gap_m=80.0, line_gap_sec=300.0):
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
         min_segment_points=3,
+        max_row_gap=line_row_gap,
     )
 
     for seg in on_road_segments:
@@ -623,7 +637,7 @@ line_gap_m = st.sidebar.number_input(
     "Map line max GPS gap (m)",
     min_value=5.0,
     max_value=150.0,
-    value=80.0,
+    value=25.0,
     step=5.0,
 )
 
@@ -631,8 +645,16 @@ line_gap_sec = st.sidebar.number_input(
     "Map line max time gap (sec)",
     min_value=10.0,
     max_value=600.0,
-    value=300.0,
+    value=90.0,
     step=10.0,
+)
+
+line_row_gap = st.sidebar.number_input(
+    "Map max missing rows between points",
+    min_value=1,
+    max_value=50,
+    value=3,
+    step=1,
 )
 
 show_map = st.sidebar.checkbox("Show map", value=True)
@@ -706,7 +728,7 @@ try:
         st.caption(
             "Use layer control to toggle On_Farm, On_Road, Removed_Points, Farm_Boundary, and Worked_Strip."
         )
-        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec)
+        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec, line_row_gap=line_row_gap)
 
     st.subheader("Data Preview")
 
