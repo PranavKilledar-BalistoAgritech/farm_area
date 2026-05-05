@@ -13,10 +13,6 @@ from farm_area import (
 )
 
 
-# =========================
-# PAGE CONFIG
-# =========================
-
 st.set_page_config(
     page_title="Farm Area Calculator",
     page_icon="🌾",
@@ -25,13 +21,37 @@ st.set_page_config(
 
 
 # =========================
-# HELPER FUNCTIONS
+# Helper functions
 # =========================
 
+def get_lat_lon_cols(df):
+    """Return latitude and longitude column names used by the backend."""
+    if df is None or df.empty:
+        return None, None
+
+    if "latitude" in df.columns and "longitude" in df.columns:
+        return "latitude", "longitude"
+
+    if "lat" in df.columns and "lon" in df.columns:
+        return "lat", "lon"
+
+    return None, None
+
+
+def get_time_column(df):
+    """Return available timestamp column."""
+    if df is None or df.empty:
+        return None
+
+    for col in ["timestamp", "time", "created_at", "datetime", "date_time"]:
+        if col in df.columns:
+            return col
+
+    return None
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
-    """
-    Distance between two GPS points in meters.
-    """
+    """Distance between two GPS points in meters."""
     if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
         return None
 
@@ -49,130 +69,118 @@ def haversine_m(lat1, lon1, lat2, lon2):
         math.sin(dlat / 2) ** 2
         + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     )
-
     c = 2 * math.asin(math.sqrt(a))
     return r * c
 
 
-def get_time_column(df):
-    """
-    Finds timestamp column from dataframe.
-    """
-    for col in ["timestamp", "time", "created_at", "datetime", "date_time"]:
-        if col in df.columns:
-            return col
-    return None
-
-
 def build_line_segments(
     df,
-    max_gap_m=8,
-    max_gap_sec=15,
+    max_gap_m=8.0,
+    max_gap_sec=15.0,
     min_segment_points=3,
 ):
     """
-    Builds clean line segments from GPS points.
-
-    This avoids wrong cross lines by breaking the line when:
-    - GPS distance gap is large
-    - time gap is large
-    - point is invalid
+    Build clean GPS line segments.
+    This avoids wrong cross-lines by breaking lines on large distance/time gaps.
     """
     if df is None or df.empty:
         return []
 
-    work = df.copy()
+    lat_col, lon_col = get_lat_lon_cols(df)
+    if lat_col is None or lon_col is None:
+        return []
 
-    if "lat" not in work.columns or "lon" not in work.columns:
+    work = df.copy()
+    work[lat_col] = pd.to_numeric(work[lat_col], errors="coerce")
+    work[lon_col] = pd.to_numeric(work[lon_col], errors="coerce")
+    work = work.dropna(subset=[lat_col, lon_col]).copy()
+
+    if work.empty:
         return []
 
     time_col = get_time_column(work)
 
     if time_col:
         work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
-        work = work.sort_values(time_col)
+        if work[time_col].notna().any():
+            work = work.sort_values(time_col).reset_index(drop=True)
+        elif "row_id" in work.columns:
+            work = work.sort_values("row_id").reset_index(drop=True)
     elif "row_id" in work.columns:
-        work = work.sort_values("row_id")
+        work = work.sort_values("row_id").reset_index(drop=True)
+    else:
+        work = work.reset_index(drop=True)
 
     segments = []
     current_segment = []
-
-    prev_lat = None
-    prev_lon = None
-    prev_time = None
+    prev_row = None
 
     for _, row in work.iterrows():
-        lat = row.get("lat")
-        lon = row.get("lon")
+        lat = float(row[lat_col])
+        lon = float(row[lon_col])
+        point = [lat, lon]
 
-        if pd.isna(lat) or pd.isna(lon):
+        if prev_row is None:
+            current_segment = [point]
+            prev_row = row
             continue
 
-        curr_time = row.get(time_col) if time_col else None
-
+        dist_m = haversine_m(prev_row[lat_col], prev_row[lon_col], lat, lon)
         start_new_segment = False
 
-        if prev_lat is not None and prev_lon is not None:
-            dist_m = haversine_m(prev_lat, prev_lon, lat, lon)
+        if dist_m is None or dist_m > max_gap_m:
+            start_new_segment = True
 
-            if dist_m is None or dist_m > max_gap_m:
-                start_new_segment = True
-
-            if time_col and prev_time is not None and curr_time is not None:
-                if not pd.isna(prev_time) and not pd.isna(curr_time):
-                    gap_sec = abs((curr_time - prev_time).total_seconds())
-                    if gap_sec > max_gap_sec:
-                        start_new_segment = True
+        if time_col:
+            prev_time = prev_row.get(time_col)
+            curr_time = row.get(time_col)
+            if pd.notna(prev_time) and pd.notna(curr_time):
+                gap_sec = abs((curr_time - prev_time).total_seconds())
+                if gap_sec > max_gap_sec:
+                    start_new_segment = True
 
         if start_new_segment:
-            if len(current_segment) >= min_segment_points:
+            if len(current_segment) >= int(min_segment_points):
                 segments.append(current_segment)
+            current_segment = [point]
+        else:
+            current_segment.append(point)
 
-            current_segment = []
+        prev_row = row
 
-        current_segment.append([float(lat), float(lon)])
-
-        prev_lat = lat
-        prev_lon = lon
-        prev_time = curr_time
-
-    if len(current_segment) >= min_segment_points:
+    if len(current_segment) >= int(min_segment_points):
         segments.append(current_segment)
 
     return segments
 
 
-def classify_on_road_points(df, wheel_th=20, rotor_th=50):
-    """
-    On_Road:
-    Rotor is OFF and wheels are moving.
-    """
+def classify_on_road_points(df, wheel_th=20.0, rotor_th=50.0):
+    """On_Road = rotor OFF and either wheel is moving."""
     if df is None or df.empty:
         return pd.DataFrame()
 
-    work = df.copy()
+    needed = {"left_rpm", "right_rpm", "rotor_rpm"}
+    if not needed.issubset(df.columns):
+        return df.iloc[0:0].copy()
 
-    required_cols = ["left_rpm", "right_rpm", "rotor_rpm"]
-    for col in required_cols:
-        if col not in work.columns:
-            work[col] = 0
+    out = df.copy()
+    out["left_rpm"] = pd.to_numeric(out["left_rpm"], errors="coerce").fillna(0)
+    out["right_rpm"] = pd.to_numeric(out["right_rpm"], errors="coerce").fillna(0)
+    out["rotor_rpm"] = pd.to_numeric(out["rotor_rpm"], errors="coerce").fillna(0)
 
-    on_road_mask = (
-        (work["rotor_rpm"].fillna(0) <= rotor_th)
+    mask = (
+        (out["rotor_rpm"].abs() <= rotor_th)
         & (
-            (work["left_rpm"].fillna(0).abs() > wheel_th)
-            | (work["right_rpm"].fillna(0).abs() > wheel_th)
+            (out["left_rpm"].abs() > wheel_th)
+            | (out["right_rpm"].abs() > wheel_th)
         )
     )
 
-    return work[on_road_mask].copy()
+    return out.loc[mask].copy()
 
 
 def remove_rows_by_row_id(source_df, remove_df):
-    """
-    Removes rows from source_df where row_id exists in remove_df.
-    Useful to avoid showing On_Road points also as Removed points.
-    """
+    """Remove rows from source_df if row_id exists in remove_df."""
     if source_df is None or source_df.empty:
         return pd.DataFrame()
 
@@ -183,18 +191,18 @@ def remove_rows_by_row_id(source_df, remove_df):
         return source_df.copy()
 
     remove_ids = set(remove_df["row_id"].dropna().tolist())
-    return source_df[~source_df["row_id"].isin(remove_ids)].copy()
+    return source_df.loc[~source_df["row_id"].isin(remove_ids)].copy()
 
 
 def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
-    """
-    Adds shapely geometry as GeoJSON layer on folium map.
-    """
-    if geom is None or geom.is_empty:
+    """Add backend shapely geometry on map."""
+    if geom is None or getattr(geom, "is_empty", True):
         return
 
     try:
         geojson_data = geom_to_geojson_coords(geom, to_wgs)
+        if not geojson_data:
+            return
 
         folium.GeoJson(
             geojson_data,
@@ -206,15 +214,12 @@ def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
                 "fillOpacity": fill_opacity,
             },
         ).add_to(m)
-
     except Exception:
         pass
 
 
-def render_map(result):
-    """
-    Renders GPS map with clean segmented lines.
-    """
+def render_map(result, line_gap_m=8.0, line_gap_sec=15.0):
+    """Render satellite map with clean segmented farm lines."""
     all_df = result.get("all_df", pd.DataFrame())
     clean_df = result.get("clean_df", pd.DataFrame())
     removed_df = result.get("removed_df", pd.DataFrame())
@@ -223,12 +228,18 @@ def render_map(result):
     path_geom = result.get("path_geom")
     to_wgs = result.get("to_wgs")
 
-    if all_df is None or all_df.empty:
+    lat_col, lon_col = get_lat_lon_cols(all_df)
+    if all_df is None or all_df.empty or lat_col is None or lon_col is None:
         st.warning("No GPS data available for map.")
         return
 
-    center_lat = all_df["lat"].mean()
-    center_lon = all_df["lon"].mean()
+    valid_points = all_df[[lat_col, lon_col]].dropna()
+    if valid_points.empty:
+        st.warning("No valid GPS points available for map.")
+        return
+
+    center_lat = float(valid_points[lat_col].mean())
+    center_lon = float(valid_points[lon_col].mean())
 
     m = folium.Map(
         location=[center_lat, center_lon],
@@ -245,22 +256,15 @@ def render_map(result):
         control=True,
     ).add_to(m)
 
-    # =========================
-    # LAYERS
-    # =========================
-
     on_farm_layer = folium.FeatureGroup(name="On_Farm", show=True)
     on_road_layer = folium.FeatureGroup(name="On_Road", show=True)
     removed_layer = folium.FeatureGroup(name="Removed_Points", show=True)
 
-    # =========================
-    # ON FARM GREEN LINES
-    # =========================
-
+    # Green On_Farm lines
     on_farm_segments = build_line_segments(
         clean_df,
-        max_gap_m=8,
-        max_gap_sec=15,
+        max_gap_m=line_gap_m,
+        max_gap_sec=line_gap_sec,
         min_segment_points=3,
     )
 
@@ -272,16 +276,12 @@ def render_map(result):
             opacity=0.9,
         ).add_to(on_farm_layer)
 
-    # =========================
-    # ON ROAD YELLOW LINES
-    # =========================
-
+    # Yellow On_Road lines
     on_road_df = classify_on_road_points(all_df)
-
     on_road_segments = build_line_segments(
         on_road_df,
-        max_gap_m=8,
-        max_gap_sec=15,
+        max_gap_m=line_gap_m,
+        max_gap_sec=line_gap_sec,
         min_segment_points=3,
     )
 
@@ -293,21 +293,19 @@ def render_map(result):
             opacity=0.9,
         ).add_to(on_road_layer)
 
-    # =========================
-    # REMOVED RED POINTS
-    # =========================
-
+    # Red removed points
     removed_display_df = remove_rows_by_row_id(removed_df, on_road_df)
+    rem_lat_col, rem_lon_col = get_lat_lon_cols(removed_display_df)
 
-    if removed_display_df is not None and not removed_display_df.empty:
+    if removed_display_df is not None and not removed_display_df.empty and rem_lat_col and rem_lon_col:
         for _, row in removed_display_df.iterrows():
-            lat = row.get("lat")
-            lon = row.get("lon")
+            lat = row.get(rem_lat_col)
+            lon = row.get(rem_lon_col)
 
             if pd.isna(lat) or pd.isna(lon):
                 continue
 
-            reason = row.get("removed_reason", "removed")
+            reason = row.get("remove_reason", row.get("removed_reason", "removed"))
 
             folium.CircleMarker(
                 location=[float(lat), float(lon)],
@@ -322,10 +320,6 @@ def render_map(result):
     on_farm_layer.add_to(m)
     on_road_layer.add_to(m)
     removed_layer.add_to(m)
-
-    # =========================
-    # FARM BOUNDARY / WORKED STRIP
-    # =========================
 
     if to_wgs is not None:
         add_geojson_layer(
@@ -348,18 +342,12 @@ def render_map(result):
             fill_opacity=0.18,
         )
 
-    # =========================
-    # FIT BOUNDS
-    # =========================
-
     try:
-        valid_points = all_df[["lat", "lon"]].dropna()
-        if not valid_points.empty:
-            bounds = [
-                [valid_points["lat"].min(), valid_points["lon"].min()],
-                [valid_points["lat"].max(), valid_points["lon"].max()],
-            ]
-            m.fit_bounds(bounds)
+        bounds = [
+            [float(valid_points[lat_col].min()), float(valid_points[lon_col].min())],
+            [float(valid_points[lat_col].max()), float(valid_points[lon_col].max())],
+        ]
+        m.fit_bounds(bounds)
     except Exception:
         pass
 
@@ -374,7 +362,7 @@ def render_map(result):
 
 
 # =========================
-# SIDEBAR
+# Sidebar
 # =========================
 
 st.sidebar.title("Settings")
@@ -459,18 +447,33 @@ boundary_erode_m = st.sidebar.number_input(
     step=0.1,
 )
 
+st.sidebar.markdown("---")
+
+line_gap_m = st.sidebar.number_input(
+    "Map line max gap (m)",
+    min_value=2.0,
+    max_value=30.0,
+    value=8.0,
+    step=1.0,
+)
+
+line_gap_sec = st.sidebar.number_input(
+    "Map line max time gap (sec)",
+    min_value=2.0,
+    max_value=120.0,
+    value=15.0,
+    step=1.0,
+)
+
 show_map = st.sidebar.checkbox("Show map", value=True)
 
 
 # =========================
-# MAIN UI
+# Main UI
 # =========================
 
 st.title("Farm Area Calculator")
-
-st.write(
-    "Upload machine GPS and RPM data to calculate worked farm area."
-)
+st.write("Upload machine GPS and RPM data to calculate worked farm area.")
 
 if uploaded_file is None:
     st.info("Please upload CSV or Excel file.")
@@ -484,14 +487,14 @@ try:
         st.stop()
 
     result = calculate_farm_area_from_df(
-        df,
+        input_df=df,
         work_width_ft=work_width_ft,
-        max_jump_m=max_jump_m,
+        max_point_jump_m=max_jump_m,
         dbscan_eps_m=dbscan_eps_m,
-        dbscan_min_samples=dbscan_min_samples,
-        lof_neighbors=lof_neighbors,
+        dbscan_min_samples=int(dbscan_min_samples),
+        lof_neighbors=int(lof_neighbors),
         lof_contamination=lof_contamination,
-        boundary_point_buffer_m=boundary_point_buffer_m,
+        point_buffer_m=boundary_point_buffer_m,
         boundary_smooth_m=boundary_smooth_m,
         boundary_erode_m=boundary_erode_m,
     )
@@ -503,80 +506,44 @@ try:
     on_road_df = classify_on_road_points(all_df)
     removed_display_df = remove_rows_by_row_id(removed_df, on_road_df)
 
-    # =========================
-    # METRICS
-    # =========================
-
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        st.metric(
-            "4 ft strip check (guntha)",
-            round(result.get("path_area_guntha", 0), 3),
-        )
+        st.metric("4 ft strip check (guntha)", round(result.get("path_area_guntha", 0), 3))
 
     with c2:
-        st.metric(
-            "Total points",
-            len(all_df) if all_df is not None else 0,
-        )
+        st.metric("Total points", len(all_df) if all_df is not None else 0)
 
     with c3:
-        st.metric(
-            "On_Farm points",
-            len(clean_df) if clean_df is not None else 0,
-        )
+        st.metric("On_Farm points", len(clean_df) if clean_df is not None else 0)
 
     with c4:
-        st.metric(
-            "Removed points",
-            len(removed_display_df) if removed_display_df is not None else 0,
-        )
+        st.metric("Removed points", len(removed_display_df) if removed_display_df is not None else 0)
 
     c5, c6, c7 = st.columns(3)
 
     with c5:
-        st.metric(
-            "On_Road points",
-            len(on_road_df) if on_road_df is not None else 0,
-        )
+        st.metric("On_Road points", len(on_road_df) if on_road_df is not None else 0)
 
     with c6:
-        st.metric(
-            "Raw path area sq.ft",
-            round(result.get("path_area_sqft", 0), 2),
-        )
+        st.metric("Raw path area sq.ft", round(result.get("path_area_sqft", 0), 2))
 
     with c7:
-        st.metric(
-            "Boundary area guntha",
-            round(result.get("concave_area_guntha", 0), 3),
-        )
-
-    # =========================
-    # MAP
-    # =========================
+        st.metric("Boundary area guntha", round(result.get("concave_area_guntha", 0), 3))
 
     if show_map:
         st.subheader("Filtered GPS map")
         st.caption(
-            "Use the layer control on the map to toggle On_Farm, On_Road, Removed_Points, Farm_Boundary, and Worked_Strip."
+            "Use layer control to toggle On_Farm, On_Road, Removed_Points, Farm_Boundary, and Worked_Strip."
         )
-        render_map(result)
-
-    # =========================
-    # DATA TABLES
-    # =========================
+        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec)
 
     st.subheader("Data Preview")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["On_Farm", "On_Road", "Removed", "All Data"]
-    )
+    tab1, tab2, tab3, tab4 = st.tabs(["On_Farm", "On_Road", "Removed", "All Data"])
 
     with tab1:
         st.dataframe(clean_df, use_container_width=True)
-
         if clean_df is not None and not clean_df.empty:
             st.download_button(
                 label="Download On_Farm CSV",
@@ -587,7 +554,6 @@ try:
 
     with tab2:
         st.dataframe(on_road_df, use_container_width=True)
-
         if on_road_df is not None and not on_road_df.empty:
             st.download_button(
                 label="Download On_Road CSV",
@@ -598,7 +564,6 @@ try:
 
     with tab3:
         st.dataframe(removed_display_df, use_container_width=True)
-
         if removed_display_df is not None and not removed_display_df.empty:
             st.download_button(
                 label="Download Removed CSV",
@@ -609,7 +574,6 @@ try:
 
     with tab4:
         st.dataframe(all_df, use_container_width=True)
-
         if all_df is not None and not all_df.empty:
             st.download_button(
                 label="Download All Data CSV",
