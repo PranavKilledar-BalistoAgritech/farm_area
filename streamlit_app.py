@@ -369,8 +369,12 @@ def add_geojson_layer(m, geom, to_wgs, name, color, fill_color, fill_opacity):
         pass
 
 
-def render_map(result, line_gap_m=25.0, line_gap_sec=60.0, line_heading_deg=35.0, line_min_move_m=1.0):
-    """Render satellite map with clean segmented farm lines."""
+def render_map(result, line_gap_m=80.0, line_gap_sec=300.0):
+    """Render satellite map with timestamp-based farm lines.
+
+    Map display uses filtered farm points in timestamp order only.
+    This is only for presentation and does not change area calculation.
+    """
     all_df = result.get("all_df", pd.DataFrame())
     clean_df = result.get("clean_df", pd.DataFrame())
     removed_df = result.get("removed_df", pd.DataFrame())
@@ -422,35 +426,28 @@ def render_map(result, line_gap_m=25.0, line_gap_sec=60.0, line_heading_deg=35.0
     on_road_layer = folium.FeatureGroup(name="On_Road", show=True)
     removed_layer = folium.FeatureGroup(name="Removed_Points", show=True)
 
-    # Green On_Farm sari lines
-    # For map presentation, use clean_df instead of only strong farm points.
-    # This keeps the complete sari lines visible while heading segmentation avoids random cross-connections.
-    map_farm_df = clean_df.copy()
+    # Green On_Farm lines
+    # Presentation logic: join filtered farm points only in timestamp/order sequence.
+    # Do not use heading filtering here, because GPS jitter breaks the sari lines.
+    # Use all raw On_Farm RPM points first so complete sari movement is visible.
+    map_farm_df = get_strong_farm_points(all_df)
 
-    on_farm_segments = build_sari_line_segments(
+    # If RPM columns are missing or the strict RPM filter returns nothing, fall back to clean_df.
+    if map_farm_df is None or map_farm_df.empty:
+        map_farm_df = clean_df.copy()
+
+    on_farm_segments = build_line_segments(
         map_farm_df,
         max_gap_m=line_gap_m,
         max_gap_sec=line_gap_sec,
-        max_heading_change_deg=line_heading_deg,
-        min_move_m=line_min_move_m,
-        min_segment_points=3,
+        min_segment_points=2,
     )
-
-    # Fallback: if heading-based logic becomes too strict for any dataset,
-    # still show farm lines using distance/time segmentation.
-    if not on_farm_segments:
-        on_farm_segments = build_line_segments(
-            map_farm_df,
-            max_gap_m=line_gap_m,
-            max_gap_sec=line_gap_sec,
-            min_segment_points=3,
-        )
 
     for seg in on_farm_segments:
         folium.PolyLine(
             locations=seg,
             color="lime",
-            weight=5,
+            weight=4,
             opacity=0.95,
         ).add_to(on_farm_layer)
 
@@ -623,35 +620,19 @@ boundary_erode_m = st.sidebar.number_input(
 st.sidebar.markdown("---")
 
 line_gap_m = st.sidebar.number_input(
-    "Map line max gap (m)",
-    min_value=2.0,
-    max_value=50.0,
-    value=25.0,
-    step=1.0,
+    "Map line max GPS gap (m)",
+    min_value=5.0,
+    max_value=150.0,
+    value=80.0,
+    step=5.0,
 )
 
 line_gap_sec = st.sidebar.number_input(
     "Map line max time gap (sec)",
-    min_value=2.0,
-    max_value=180.0,
-    value=90.0,
-    step=1.0,
-)
-
-line_heading_deg = st.sidebar.number_input(
-    "Map line max heading change (deg)",
-    min_value=5.0,
-    max_value=90.0,
-    value=60.0,
-    step=5.0,
-)
-
-line_min_move_m = st.sidebar.number_input(
-    "Map line minimum movement (m)",
-    min_value=0.1,
-    max_value=5.0,
-    value=0.5,
-    step=0.1,
+    min_value=10.0,
+    max_value=600.0,
+    value=300.0,
+    step=10.0,
 )
 
 show_map = st.sidebar.checkbox("Show map", value=True)
@@ -725,7 +706,7 @@ try:
         st.caption(
             "Use layer control to toggle On_Farm, On_Road, Removed_Points, Farm_Boundary, and Worked_Strip."
         )
-        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec, line_heading_deg=line_heading_deg, line_min_move_m=line_min_move_m)
+        render_map(result, line_gap_m=line_gap_m, line_gap_sec=line_gap_sec)
 
     st.subheader("Data Preview")
 
